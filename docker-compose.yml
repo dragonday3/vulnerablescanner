@@ -7,6 +7,14 @@ services:
       - ./backend:/app
     ports:
       - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+psycopg://vulnsight:vulnsight@postgres:5432/vulnsight
+      - REDIS_URL=redis://redis:6379/0
+      - ENVIRONMENT=development
+      - LOG_LEVEL=INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   frontend:
     build:
@@ -17,5 +25,31 @@ services:
       - /app/node_modules
     ports:
       - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1
     depends_on:
       - backend
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=vulnsight
+      - POSTGRES_PASSWORD=vulnsight
+      - POSTGRES_DB=vulnsight
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vulnsight"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_data:
