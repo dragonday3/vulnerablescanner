@@ -24,7 +24,11 @@ class Scan(Base):
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
     target_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("targets.id", ondelete="CASCADE"), nullable=False)
-    status: Mapped[ScanStatus] = mapped_column(Enum(ScanStatus, name="scan_status"), default=ScanStatus.CREATED, nullable=False)
+    status: Mapped[ScanStatus] = mapped_column(
+        Enum(ScanStatus, name="scan_status", values_callable=lambda enum_cls: [e.value for e in enum_cls]),
+        default=ScanStatus.CREATED,
+        nullable=False,
+    )
     config: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

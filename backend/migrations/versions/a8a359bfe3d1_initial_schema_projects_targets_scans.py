@@ -1,8 +1,8 @@
 """initial schema: projects, targets, scans
 
-Revision ID: 65c51fbe1258
+Revision ID: a8a359bfe3d1
 Revises: 
-Create Date: 2026-09-06 12:27:55.760047
+Create Date: 2026-09-06 12:37:29.906460
 
 """
 from typing import Sequence, Union
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision: str = '65c51fbe1258'
+revision: str = 'a8a359bfe3d1'
 down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -33,7 +33,7 @@ def upgrade() -> None:
     sa.Column('id', sa.Uuid(), nullable=False),
     sa.Column('project_id', sa.Uuid(), nullable=False),
     sa.Column('value', sa.String(length=255), nullable=False),
-    sa.Column('target_type', sa.Enum('IP', 'DOMAIN', 'HOSTNAME', 'CIDR', name='target_type'), nullable=False),
+    sa.Column('target_type', sa.Enum('ip', 'domain', 'hostname', 'cidr', name='target_type'), nullable=False),
     sa.Column('authorization_confirmed', sa.Boolean(), nullable=False),
     sa.Column('authorization_note', sa.Text(), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
@@ -44,7 +44,7 @@ def upgrade() -> None:
     sa.Column('id', sa.Uuid(), nullable=False),
     sa.Column('project_id', sa.Uuid(), nullable=False),
     sa.Column('target_id', sa.Uuid(), nullable=False),
-    sa.Column('status', sa.Enum('CREATED', 'QUEUED', 'RUNNING', 'DISCOVERY', 'FINGERPRINTING', 'ANALYZING', 'CORRELATING', 'RISK_ANALYSIS', 'REPORT_GENERATION', 'COMPLETED', 'FAILED', 'CANCELLED', name='scan_status'), nullable=False),
+    sa.Column('status', sa.Enum('created', 'queued', 'running', 'discovery', 'fingerprinting', 'analyzing', 'correlating', 'risk_analysis', 'report_generation', 'completed', 'failed', 'cancelled', name='scan_status'), nullable=False),
     sa.Column('config', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
