@@ -3,7 +3,6 @@ import uuid
 from fastapi import Depends
 from sqlalchemy.orm import Session
 
-import app.db.base  # noqa: F401  (ensure all models are registered on Base before use)
 from app.db.session import get_db  # re-export
 from app.models.project import Project
 from app.services import project_service

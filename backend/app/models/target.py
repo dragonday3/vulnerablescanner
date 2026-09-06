@@ -2,7 +2,7 @@ import uuid, enum
 from datetime import datetime
 from sqlalchemy import String, Text, Boolean, ForeignKey, DateTime, func, Enum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from app.db.base import Base
+from app.db.base_class import Base
 
 class TargetType(str, enum.Enum):
     IP = "ip"

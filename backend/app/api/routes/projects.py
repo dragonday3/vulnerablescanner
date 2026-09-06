@@ -3,7 +3,6 @@ import uuid
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
-import app.db.base  # noqa: F401  (ensure all models are registered on Base before use)
 from app.api.deps import get_db, get_project_or_404
 from app.models.project import Project
 from app.schemas.project import ProjectCreate, ProjectRead, ProjectUpdate

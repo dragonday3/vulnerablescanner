@@ -2,7 +2,6 @@ import uuid
 
 from sqlalchemy.orm import Session
 
-import app.db.base  # noqa: F401  (ensure all models are registered on Base before use)
 from app.core.exceptions import NotFoundError
 from app.models.project import Project
 from app.schemas.project import ProjectCreate, ProjectUpdate
