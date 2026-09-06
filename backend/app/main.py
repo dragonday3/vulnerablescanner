@@ -8,6 +8,7 @@ import app.db.base  # noqa: F401  (single entry point: registers every model on 
 # of which module happens to import a model class first)
 from app.api.routes.health import router as health_router
 from app.api.routes.projects import router as projects_router
+from app.api.routes.targets import router as targets_router
 from app.core.config import get_settings
 from app.core.exceptions import NotFoundError, ValidationConflictError
 
@@ -46,3 +47,4 @@ register_exception_handlers(app)
 
 app.include_router(health_router, prefix=settings.API_V1_PREFIX)
 app.include_router(projects_router, prefix=settings.API_V1_PREFIX)
+app.include_router(targets_router, prefix=settings.API_V1_PREFIX)
