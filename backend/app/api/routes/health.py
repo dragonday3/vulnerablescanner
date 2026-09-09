@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -6,10 +8,12 @@ from app.core.config import get_settings
 from app.db.session import get_db
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get("/health")
 def health(db: Session = Depends(get_db)) -> dict[str, str]:
     db.execute(text("SELECT 1"))
     settings = get_settings()
+    logger.info("Health check OK")
     return {"status": "ok", "environment": settings.ENVIRONMENT}
