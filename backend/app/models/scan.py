@@ -33,10 +33,10 @@ class Scan(Base):
     __tablename__ = "scans"
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     project_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
     )
     target_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("targets.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("targets.id", ondelete="CASCADE"), nullable=False, index=True
     )
     status: Mapped[ScanStatus] = mapped_column(
         Enum(

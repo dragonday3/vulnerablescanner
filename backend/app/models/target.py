@@ -23,7 +23,7 @@ class Target(Base):
     __tablename__ = "targets"
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     project_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
     )
     value: Mapped[str] = mapped_column(String(255), nullable=False)
     target_type: Mapped[TargetType] = mapped_column(

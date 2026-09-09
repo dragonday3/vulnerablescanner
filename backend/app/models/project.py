@@ -23,8 +23,8 @@ class Project(Base):
     )
 
     targets: Mapped[list["Target"]] = relationship(
-        back_populates="project", cascade="all, delete-orphan"
+        back_populates="project", cascade="all, delete-orphan", passive_deletes=True
     )
     scans: Mapped[list["Scan"]] = relationship(
-        back_populates="project", cascade="all, delete-orphan"
+        back_populates="project", cascade="all, delete-orphan", passive_deletes=True
     )
