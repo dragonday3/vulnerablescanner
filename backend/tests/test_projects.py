@@ -1,4 +1,10 @@
+import uuid
+
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
+
+from app.models.scan import Scan
+from app.models.target import Target
 
 
 def test_create_and_list_project(client: TestClient) -> None:
@@ -44,3 +50,33 @@ def test_delete_project_then_get_is_404(client: TestClient) -> None:
 
     get_resp = client.get(f"/api/v1/projects/{created['id']}")
     assert get_resp.status_code == 404
+
+
+def test_delete_project_cascades_to_targets_and_scans(client: TestClient, db: Session) -> None:
+    """Deleting a project must actually remove its child target/scan rows
+    from the database (ON DELETE CASCADE at the DB level, paired with
+    passive_deletes=True on Project.targets/Project.scans) - not merely make
+    the project itself 404 afterward while orphaning children.
+    """
+    project = client.post("/api/v1/projects", json={"name": "Cascade Me"}).json()
+    target = client.post(
+        f"/api/v1/projects/{project['id']}/targets",
+        json={
+            "value": "10.0.0.20",
+            "target_type": "ip",
+            "authorization_confirmed": True,
+        },
+    ).json()
+    scan = client.post(
+        "/api/v1/scans",
+        json={"project_id": project["id"], "target_id": target["id"]},
+    ).json()
+
+    delete_resp = client.delete(f"/api/v1/projects/{project['id']}")
+    assert delete_resp.status_code == 204
+
+    # Query the DB directly (not the API) to confirm the child rows
+    # themselves are gone, not just unreachable via the now-404'd project.
+    db.expire_all()
+    assert db.get(Target, uuid.UUID(target["id"])) is None
+    assert db.get(Scan, uuid.UUID(scan["id"])) is None

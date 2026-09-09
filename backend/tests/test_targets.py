@@ -63,3 +63,25 @@ def test_targets_are_scoped_per_project(client: TestClient) -> None:
     assert list_b.status_code == 200
     assert len(list_a.json()) == 1
     assert list_b.json() == []
+
+
+def test_get_target_under_wrong_project_returns_404(client: TestClient) -> None:
+    project_a = _create_project(client, "Project A")
+    project_b = _create_project(client, "Project B")
+
+    create_resp = client.post(
+        f"/api/v1/projects/{project_a['id']}/targets",
+        json={
+            "value": "10.0.0.4",
+            "target_type": "ip",
+            "authorization_confirmed": True,
+        },
+    )
+    assert create_resp.status_code == 201
+    target = create_resp.json()
+
+    # The target exists, but under project_a — asking for it via project_b's
+    # URL must 404, not leak the target across the tenant boundary.
+    resp = client.get(f"/api/v1/projects/{project_b['id']}/targets/{target['id']}")
+
+    assert resp.status_code == 404

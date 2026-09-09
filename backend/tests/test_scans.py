@@ -93,3 +93,21 @@ def test_cancel_already_cancelled_scan_returns_409(client: TestClient) -> None:
     resp = client.post(f"/api/v1/scans/{scan['id']}/cancel")
 
     assert resp.status_code == 409
+
+
+def test_create_scan_rejects_target_from_a_different_project(client: TestClient) -> None:
+    """Cross-tenant authorization boundary: a target_id that exists but
+    belongs to a project other than the project_id in the request body must
+    be rejected, not silently accepted against the wrong project.
+    scan_service.create_scan already enforces `target.project_id !=
+    data.project_id` -> NotFoundError, but this had zero test coverage.
+    """
+    ctx_a = _create_authorized_target(client)
+    project_b = client.post("/api/v1/projects", json={"name": "Other Project"}).json()
+
+    resp = client.post(
+        "/api/v1/scans",
+        json={"project_id": project_b["id"], "target_id": ctx_a["target"]["id"]},
+    )
+
+    assert resp.status_code == 404
