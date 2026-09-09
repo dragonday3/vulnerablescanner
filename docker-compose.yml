@@ -27,6 +27,11 @@ services:
       - "3000:3000"
     environment:
       - NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1
+      # Server-side (SSR) fetches run inside this container, where
+      # "localhost" is this container, not the backend. Point Server
+      # Component fetches at the backend's Docker Compose service name
+      # instead; the browser keeps using NEXT_PUBLIC_API_URL above.
+      - API_INTERNAL_URL=http://backend:8000/api/v1
     depends_on:
       - backend
 
