@@ -1,16 +1,15 @@
-fastapi
-uvicorn[standard]
-sqlalchemy>=2.0
-alembic
-psycopg[binary]
-pydantic>=2.0
-pydantic-settings
-python-dotenv
-celery
-redis
-pytest
-pytest-cov
-httpx
-ruff
-black
-mypy
+# Runtime dependencies only. Pinned to compatible-release ranges (~=) based
+# on the versions actually verified working in this project's Docker image
+# (see `docker compose exec backend pip freeze`), not guessed. Dev-only
+# tooling (test runner, linters, type checker) lives in requirements-dev.txt
+# — see that file's header and the backend README section for why.
+fastapi~=0.141
+uvicorn[standard]~=0.52
+sqlalchemy~=2.0
+alembic~=1.19
+psycopg[binary]~=3.3
+pydantic~=2.13
+pydantic-settings~=2.15
+python-dotenv~=1.2
+celery~=5.6
+redis~=8.1

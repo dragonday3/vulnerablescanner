@@ -1,0 +1,18 @@
+# Dev/CI-only tooling: test runner, HTTP test client, linters, formatter,
+# type checker. Not required to run the app itself — see requirements.txt
+# for runtime dependencies.
+#
+# Install locally with:
+#   pip install -r requirements.txt -r requirements-dev.txt
+#
+# The Docker image installs this file too (see backend/Dockerfile) so that
+# `docker compose exec backend pytest -v` / `ruff` / `black` / `mypy` keep
+# working exactly as before — the split here is about declaring runtime vs.
+# dev intent clearly in source control, not about physically excluding dev
+# tools from the running container.
+pytest~=9.1
+pytest-cov~=7.1
+httpx~=0.28
+ruff~=0.16
+black~=26.5
+mypy~=2.3
