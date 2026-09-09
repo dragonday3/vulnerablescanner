@@ -20,11 +20,18 @@ export default function ScanCreateButton({
   targets: TargetRead[];
 }) {
   const router = useRouter();
-  const [targetId, setTargetId] = useState(targets[0]?.id ?? "");
+  // The backend rejects a scan against an unauthorized target with a 400
+  // (scan_service.create_scan's defense-in-depth check), so offering those
+  // targets here would just be a confusing dead end — this page already
+  // shows a "Not authorized" badge for the exact same target above. Filter
+  // to authorized-only before anything below reads `targets`.
+  const authorizedTargets = targets.filter((target) => target.authorization_confirmed === true);
+
+  const [targetId, setTargetId] = useState(authorizedTargets[0]?.id ?? "");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const hasTargets = targets.length > 0;
+  const hasTargets = authorizedTargets.length > 0;
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -66,7 +73,7 @@ export default function ScanCreateButton({
               disabled={isSubmitting}
               className="rounded-md border border-zinc-300 px-3 py-2 text-sm text-zinc-900 focus:border-zinc-500 focus:outline-none disabled:opacity-60"
             >
-              {targets.map((target) => (
+              {authorizedTargets.map((target) => (
                 <option key={target.id} value={target.id}>
                   {target.value} ({target.target_type})
                 </option>
@@ -84,9 +91,14 @@ export default function ScanCreateButton({
             {isSubmitting ? "Starting..." : "Start scan"}
           </button>
         </>
-      ) : (
+      ) : targets.length === 0 ? (
         <p className="text-sm text-zinc-500">
           Add a target above before starting a scan.
+        </p>
+      ) : (
+        <p className="text-sm text-zinc-500">
+          This project has targets, but none are authorized for scanning yet. Confirm
+          authorization on a target above before starting a scan.
         </p>
       )}
     </form>
