@@ -39,12 +39,19 @@ from sqlalchemy.orm import Session
 # Must be set before any `app.*` import below, since app.core.config.Settings
 # (instantiated at app.main import time) requires DATABASE_URL from the
 # environment / .env file.
-os.environ.setdefault(
+_DATABASE_URL = os.environ.setdefault(
     "DATABASE_URL", "postgresql+psycopg://vulnsight:vulnsight@localhost:5432/vulnsight"
 )
+# Default TEST_DATABASE_URL to the same host/credentials as DATABASE_URL (just
+# swapping the database name), rather than hardcoding "localhost". Inside the
+# backend container, Postgres is reachable at the Compose service name
+# ("postgres"), not "localhost" — deriving from DATABASE_URL keeps this
+# correct both there and for local (non-Docker) test runs.
 TEST_DATABASE_URL = os.environ.setdefault(
     "TEST_DATABASE_URL",
-    "postgresql+psycopg://vulnsight:vulnsight@localhost:5432/vulnsight_test",
+    # render_as_string(hide_password=False): plain str(URL) masks the
+    # password as "***", which would make the derived URL unusable.
+    make_url(_DATABASE_URL).set(database="vulnsight_test").render_as_string(hide_password=False),
 )
 
 from app.db.base_class import Base  # noqa: E402
