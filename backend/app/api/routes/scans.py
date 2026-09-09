@@ -17,9 +17,7 @@ def create_scan(data: ScanCreate, db: Session = Depends(get_db)) -> Scan:
 
 
 @router.get("", response_model=list[ScanRead])
-def list_scans(
-    project_id: uuid.UUID | None = None, db: Session = Depends(get_db)
-) -> list[Scan]:
+def list_scans(project_id: uuid.UUID | None = None, db: Session = Depends(get_db)) -> list[Scan]:
     return scan_service.list_scans(db, project_id)
 
 

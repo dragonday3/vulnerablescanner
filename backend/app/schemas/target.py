@@ -19,9 +19,7 @@ class TargetCreate(TargetBase):
     @classmethod
     def must_be_confirmed(cls, value: bool) -> bool:
         if value is not True:
-            raise ValueError(
-                "Target must be confirmed as authorized before it can be added"
-            )
+            raise ValueError("Target must be confirmed as authorized before it can be added")
         return value
 
 

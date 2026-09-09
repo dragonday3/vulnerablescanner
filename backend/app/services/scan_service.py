@@ -18,9 +18,7 @@ def create_scan(db: Session, data: ScanCreate) -> Scan:
 
     target = db.get(Target, data.target_id)
     if target is None or target.project_id != data.project_id:
-        raise NotFoundError(
-            f"Target {data.target_id} not found for project {data.project_id}"
-        )
+        raise NotFoundError(f"Target {data.target_id} not found for project {data.project_id}")
 
     # Defense-in-depth: re-verify authorization at scan-creation time, even
     # though Target creation already enforces this via its own validator.
@@ -56,9 +54,7 @@ def get_scan(db: Session, scan_id: uuid.UUID) -> Scan:
 def cancel_scan(db: Session, scan_id: uuid.UUID) -> Scan:
     scan = get_scan(db, scan_id)
     if scan.status not in CANCELLABLE_STATUSES:
-        raise ScanStateError(
-            f"Scan cannot be cancelled from status '{scan.status.value}'"
-        )
+        raise ScanStateError(f"Scan cannot be cancelled from status '{scan.status.value}'")
     scan.status = ScanStatus.CANCELLED
     db.commit()
     db.refresh(scan)

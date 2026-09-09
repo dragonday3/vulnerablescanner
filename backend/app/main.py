@@ -2,16 +2,21 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-import app.db.base  # noqa: F401  (single entry point: registers every model on Base
-# before any request touches the ORM, so cross-model relationship() string
-# references like Project.targets/Project.scans resolve correctly regardless
-# of which module happens to import a model class first)
 from app.api.routes.health import router as health_router
 from app.api.routes.projects import router as projects_router
 from app.api.routes.scans import router as scans_router
 from app.api.routes.targets import router as targets_router
 from app.core.config import get_settings
 from app.core.exceptions import NotFoundError, ScanStateError, ValidationConflictError
+
+# Single entry point: registers every model on Base before any request
+# touches the ORM, so cross-model relationship() string references like
+# Project.targets/Project.scans resolve correctly regardless of which module
+# happens to import a model class first. Imported as `from app.db import
+# base` (not `import app.db.base`) so it doesn't bind the name `app` in this
+# module's namespace, which would otherwise shadow the `app = FastAPI()`
+# variable below for type checkers.
+from app.db import base as _db_base  # noqa: F401
 
 settings = get_settings()
 
@@ -44,9 +49,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         )
 
     @app.exception_handler(ScanStateError)
-    def scan_state_error_handler(
-        request: Request, exc: ScanStateError
-    ) -> JSONResponse:
+    def scan_state_error_handler(request: Request, exc: ScanStateError) -> JSONResponse:
         return JSONResponse(
             status_code=409,
             content={"detail": str(exc), "code": "scan_state_conflict"},
