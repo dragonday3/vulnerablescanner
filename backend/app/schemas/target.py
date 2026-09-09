@@ -1,13 +1,13 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.target import TargetType
 
 
 class TargetBase(BaseModel):
-    value: str
+    value: str = Field(min_length=1, max_length=255)
     target_type: TargetType
     authorization_note: str | None = None
 

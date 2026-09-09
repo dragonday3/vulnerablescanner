@@ -1,6 +1,9 @@
+import logging
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.routes.health import router as health_router
 from app.api.routes.projects import router as projects_router
@@ -8,6 +11,7 @@ from app.api.routes.scans import router as scans_router
 from app.api.routes.targets import router as targets_router
 from app.core.config import get_settings
 from app.core.exceptions import NotFoundError, ScanStateError, ValidationConflictError
+from app.core.logging import configure_logging
 
 # Single entry point: registers every model on Base before any request
 # touches the ORM, so cross-model relationship() string references like
@@ -19,6 +23,13 @@ from app.core.exceptions import NotFoundError, ScanStateError, ValidationConflic
 from app.db import base as _db_base  # noqa: F401
 
 settings = get_settings()
+
+# Configured once at import time (before the exception handlers/routers
+# below), so every log emitted during app startup and request handling —
+# including uvicorn's own access/error logs — goes through the JSON
+# formatter.
+configure_logging(settings)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -53,6 +64,20 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=409,
             content={"detail": str(exc), "code": "scan_state_conflict"},
+        )
+
+    @app.exception_handler(SQLAlchemyError)
+    def sqlalchemy_error_handler(request: Request, exc: SQLAlchemyError) -> JSONResponse:
+        # Catch-all for DB-layer errors that escape the service layer (e.g.
+        # an IntegrityError from a constraint the Pydantic schema didn't
+        # catch). Log the real error server-side only — the client gets a
+        # generic message in the same {"detail", "code"} envelope shape as
+        # every other handler above, so the error envelope is uniform
+        # regardless of error type.
+        logger.error("Unhandled database error", exc_info=exc)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error", "code": "internal_error"},
         )
 
 
