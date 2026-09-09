@@ -1,6 +1,7 @@
 import Link from "next/link";
 import ProjectForm from "@/components/ProjectForm";
 import { listProjects } from "@/lib/api/projects";
+import type { ProjectRead } from "@/lib/types/project";
 
 // This page always reflects live backend state (projects can be created via
 // the form or the API at any time), so it must never be statically
@@ -18,7 +19,20 @@ function formatDate(iso: string): string {
 }
 
 export default async function ProjectsPage() {
-  const projects = await listProjects();
+  // listProjects() throws on a network error or non-2xx response (e.g. the
+  // backend is unreachable). Without this try/catch that exception would
+  // propagate out of the server component and hit Next's generic default
+  // error boundary — a realistic failure mode (we hit a real
+  // backend-unreachable bug earlier in this task) worth a friendly inline
+  // message instead.
+  let projects: ProjectRead[] = [];
+  let loadError: string | null = null;
+  try {
+    projects = await listProjects();
+  } catch (err) {
+    loadError =
+      err instanceof Error ? err.message : "Failed to load projects.";
+  }
 
   return (
     // Explicit light background: globals.css darkens the body under
@@ -39,7 +53,11 @@ export default async function ProjectsPage() {
             Existing projects
           </h2>
 
-          {projects.length === 0 ? (
+          {loadError ? (
+            <p className="rounded-lg border border-red-200 bg-red-50 px-4 py-6 text-center text-sm text-red-700">
+              Couldn&apos;t load projects — is the backend running?
+            </p>
+          ) : projects.length === 0 ? (
             <p className="rounded-lg border border-dashed border-zinc-300 px-4 py-6 text-center text-sm text-zinc-500">
               No projects yet. Create one below to get started.
             </p>
