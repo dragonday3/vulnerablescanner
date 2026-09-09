@@ -6,6 +6,7 @@ import ScanCreateButton from "@/components/ScanCreateButton";
 import { getProject } from "@/lib/api/projects";
 import { listTargets } from "@/lib/api/targets";
 import { listScans } from "@/lib/api/scans";
+import type { ProjectRead } from "@/lib/types/project";
 import type { TargetRead } from "@/lib/types/target";
 import type { ScanRead } from "@/lib/types/scan";
 
@@ -24,15 +25,44 @@ export default async function ProjectDetailPage({
 }: PageProps<"/projects/[projectId]">) {
   const { projectId } = await params;
 
-  // getProject() is the one fetch this page cannot render without — if the
-  // project doesn't exist (404) or the backend is unreachable, there is no
-  // meaningful page to show, so surface Next's not-found UI rather than an
-  // inline message on an otherwise-broken page.
-  let project;
+  // getProject() is the one fetch this page cannot render without, but a
+  // real 404 (project doesn't exist) and a backend-unreachable/network
+  // failure are different problems and must not look the same to the user.
+  // `client.ts`'s `request()` throws `Error(\`API error ${res.status}: ...\`)`
+  // on any non-2xx response, so the status is recoverable from the message:
+  // only a genuine "API error 404: ..." routes to Next's not-found UI —
+  // every other failure (5xx, network error, etc.) falls through to an
+  // inline error below, consistent with `/projects/page.tsx`'s (Task 11)
+  // "couldn't load — is the backend running?" pattern.
+  let project: ProjectRead;
   try {
     project = await getProject(projectId);
-  } catch {
-    notFound();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "";
+    if (message.startsWith("API error 404:")) {
+      notFound();
+    }
+    // Any other failure (5xx, network error, etc.) — render an inline
+    // error instead of `project.name` etc. below, since there's no project
+    // to render the rest of the page around. `min-h-screen` (viewport-
+    // relative), not `min-h-full` (parent-relative): this branch's content
+    // is short, and `min-h-full` only stretches to the ancestor chain's
+    // height, which isn't pinned to the viewport here — with short content
+    // that left globals.css's dark-mode body background exposed below the
+    // card. `min-h-screen` always covers the full viewport regardless of
+    // content length.
+    return (
+      <div className="min-h-screen bg-zinc-50">
+        <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-6 py-12">
+          <Link href="/projects" className="text-sm text-zinc-500 hover:underline">
+            &larr; All projects
+          </Link>
+          <p className="rounded-lg border border-red-200 bg-red-50 px-4 py-6 text-center text-sm text-red-700">
+            Couldn&apos;t load this project — is the backend running?
+          </p>
+        </div>
+      </div>
+    );
   }
 
   // Targets and scans are independent, secondary fetches: if one fails the
@@ -68,7 +98,10 @@ export default async function ProjectDetailPage({
     // globals.css darkens the body under `prefers-color-scheme: dark`, and
     // per the "no dark-mode toggle" constraint this page always renders one
     // consistent light theme rather than following the system preference.
-    <div className="min-h-full bg-zinc-50">
+    // `min-h-screen` (viewport-relative) rather than `min-h-full` (parent-
+    // relative, which only stretches as far as the ancestor chain's actual
+    // height) — see the error-branch return above for why this matters.
+    <div className="min-h-screen bg-zinc-50">
       <div className="mx-auto flex w-full max-w-3xl flex-col gap-8 px-6 py-12">
         <header className="flex flex-col gap-1">
           <Link href="/projects" className="text-sm text-zinc-500 hover:underline">
