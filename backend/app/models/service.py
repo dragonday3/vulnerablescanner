@@ -14,7 +14,9 @@ if TYPE_CHECKING:
 class Service(Base):
     __tablename__ = "services"
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    asset_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("assets.id", ondelete="CASCADE"), index=True, nullable=False)
+    asset_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("assets.id", ondelete="CASCADE"), index=True, nullable=False
+    )
     port: Mapped[int] = mapped_column(Integer, nullable=False)
     protocol: Mapped[str] = mapped_column(String(10), nullable=False, default="tcp")
     state: Mapped[str] = mapped_column(String(20), nullable=False, default="open")
