@@ -11,6 +11,8 @@ from app.models.target import TargetType
 # of letters, digits, and hyphens, no leading/trailing hyphen per label.
 _HOSTNAME_LABEL = r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
 _HOSTNAME_RE = re.compile(rf"^{_HOSTNAME_LABEL}(\.{_HOSTNAME_LABEL})*$")
+# NOTE: re.fullmatch (used below) makes the "$" here redundant against
+# trailing-newline bypasses on its own merits; kept for readability.
 
 # Shell metacharacters and other characters that must never appear in a value
 # that may eventually reach a subprocess argument list (see Task 4's
@@ -41,6 +43,19 @@ class TargetCreate(TargetBase):
 
         target_type = info.data.get("target_type")
 
+        if target_type in (TargetType.IP, TargetType.CIDR):
+            # Python's ipaddress module implements RFC 4007 IPv6 zone IDs
+            # ("fe80::1%eth0"), and accepts almost any character after the
+            # "%" (only "%" and "/" are excluded) up to the length cap -
+            # including Unicode. Scan targets have no legitimate use for a
+            # zone ID (that addresses a local interface, not a remote
+            # target), and such a suffix is exactly the kind of
+            # near-unrestricted text that must never reach Task 4's Nmap
+            # subprocess call unexamined. Reject it outright rather than
+            # trying to validate the zone-ID content itself.
+            if "%" in value:
+                raise ValueError(f"'{value}' must not contain an IPv6 zone ID ('%...' suffix)")
+
         if target_type == TargetType.IP:
             try:
                 ipaddress.ip_address(value)
@@ -52,7 +67,7 @@ class TargetCreate(TargetBase):
             except ValueError as exc:
                 raise ValueError(f"'{value}' is not a valid CIDR network") from exc
         elif target_type in (TargetType.DOMAIN, TargetType.HOSTNAME):
-            if len(value) > 253 or not _HOSTNAME_RE.match(value):
+            if len(value) > 253 or not _HOSTNAME_RE.fullmatch(value):
                 raise ValueError(f"'{value}' is not a valid hostname/domain")
 
         return value

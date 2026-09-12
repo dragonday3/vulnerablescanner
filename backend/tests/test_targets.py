@@ -153,6 +153,31 @@ def test_create_target_rejects_invalid_value_for_type(
     assert resp.status_code == 422
 
 
+@pytest.mark.parametrize(
+    ("value", "target_type"),
+    [
+        # RFC 4007 IPv6 zone IDs: Python's ipaddress module accepts almost
+        # any character after "%" (only "%" and "/" excluded), including
+        # parens, flags, and Unicode. Scan targets have no legitimate use
+        # for a zone ID, so this must be rejected outright for ip and cidr.
+        ("fe80::1%eth0", "ip"),
+        ("fe80::1%(x)", "ip"),
+        ("fe80::1%--help", "ip"),
+        ("fe80::1%ééé", "ip"),  # Unicode zone ID (é é é)
+        ("fe80::1%" + "a" * 200, "ip"),
+        ("fe80::1%eth0/64", "cidr"),
+    ],
+)
+def test_create_target_rejects_ipv6_zone_id(
+    client: TestClient, value: str, target_type: str
+) -> None:
+    project = _create_project(client)
+
+    resp = _create_target(client, project["id"], value, target_type)
+
+    assert resp.status_code == 422, resp.text
+
+
 @pytest.mark.parametrize("target_type", ["ip", "cidr", "domain", "hostname"])
 def test_create_target_rejects_shell_metacharacters_regardless_of_type(
     client: TestClient, target_type: str
