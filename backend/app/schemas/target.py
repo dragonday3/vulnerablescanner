@@ -1,19 +1,61 @@
+import ipaddress
+import re
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 from app.models.target import TargetType
 
+# Conservative hostname/domain pattern per RFC 1035/1123: dot-separated labels
+# of letters, digits, and hyphens, no leading/trailing hyphen per label.
+_HOSTNAME_LABEL = r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+_HOSTNAME_RE = re.compile(rf"^{_HOSTNAME_LABEL}(\.{_HOSTNAME_LABEL})*$")
+
+# Shell metacharacters and other characters that must never appear in a value
+# that may eventually reach a subprocess argument list (see Task 4's
+# NmapPortScanner). Checked outright, before any format-specific parsing.
+_FORBIDDEN_CHARS_RE = re.compile(r"[;|&`$<>'\"\s\x00-\x1f\x7f]")
+
 
 class TargetBase(BaseModel):
-    value: str = Field(min_length=1, max_length=255)
+    # target_type is declared before value so that, in subclasses adding a
+    # field_validator on "value", ValidationInfo.data already has target_type
+    # populated (pydantic v2 validates fields in declaration order).
     target_type: TargetType
+    value: str = Field(min_length=1, max_length=255)
     authorization_note: str | None = None
 
 
 class TargetCreate(TargetBase):
     authorization_confirmed: bool
+
+    @field_validator("value")
+    @classmethod
+    def validate_value_format(cls, value: str, info: ValidationInfo) -> str:
+        if _FORBIDDEN_CHARS_RE.search(value):
+            raise ValueError(
+                "Target value must not contain whitespace, shell metacharacters "
+                "(; | & ` $ < > quotes), or control characters"
+            )
+
+        target_type = info.data.get("target_type")
+
+        if target_type == TargetType.IP:
+            try:
+                ipaddress.ip_address(value)
+            except ValueError as exc:
+                raise ValueError(f"'{value}' is not a valid IP address") from exc
+        elif target_type == TargetType.CIDR:
+            try:
+                ipaddress.ip_network(value, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"'{value}' is not a valid CIDR network") from exc
+        elif target_type in (TargetType.DOMAIN, TargetType.HOSTNAME):
+            if len(value) > 253 or not _HOSTNAME_RE.match(value):
+                raise ValueError(f"'{value}' is not a valid hostname/domain")
+
+        return value
 
     @field_validator("authorization_confirmed")
     @classmethod
