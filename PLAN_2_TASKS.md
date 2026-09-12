@@ -270,8 +270,10 @@ round-trips successfully.
 
 ## Task 6: Scan orchestration task
 
-In `backend/app/workers/tasks.py`, replace/add alongside the Task 5
-placeholder: `run_scan_task(scan_id: str)`, a `@celery_app.task`-decorated
+In `backend/app/workers/tasks.py`, ADD alongside the Task 5 `ping`
+placeholder (keep `ping` — it's a cheap, harmless diagnostic task, useful
+for re-verifying broker wiring later; don't delete it):
+`run_scan_task(scan_id: str)`, a `@celery_app.task`-decorated
 function. Sequence (open a `SessionLocal()` at the top, `try/finally:
 db.close()` around the whole body):
 
