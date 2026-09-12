@@ -1,10 +1,13 @@
 import uuid
 
+import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.scan import Scan
 from app.models.target import Target
+from app.services import project_service
 
 
 def test_create_and_list_project(client: TestClient) -> None:
@@ -80,3 +83,26 @@ def test_delete_project_cascades_to_targets_and_scans(client: TestClient, db: Se
     db.expire_all()
     assert db.get(Target, uuid.UUID(target["id"])) is None
     assert db.get(Scan, uuid.UUID(scan["id"])) is None
+
+
+def test_unhandled_db_error_returns_uniform_500_envelope(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DB-layer error that escapes the service layer (e.g. a constraint
+    violation the Pydantic schema didn't catch) must be caught by the
+    catch-all SQLAlchemyError handler and returned in the same
+    {"detail", "code"} envelope shape as every other domain exception -
+    not FastAPI's bare default 500 body, and not a leaked raw DB error.
+    """
+
+    def raise_integrity_error(*_args: object, **_kwargs: object) -> None:
+        raise IntegrityError("INSERT INTO projects ...", {}, Exception("simulated DB failure"))
+
+    monkeypatch.setattr(project_service, "create_project", raise_integrity_error)
+
+    resp = client.post("/api/v1/projects", json={"name": "Will Fail"})
+
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body == {"detail": "Internal server error", "code": "internal_error"}
+    assert "simulated DB failure" not in resp.text

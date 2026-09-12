@@ -25,9 +25,12 @@ from app.db import base as _db_base  # noqa: F401
 settings = get_settings()
 
 # Configured once at import time (before the exception handlers/routers
-# below), so every log emitted during app startup and request handling —
-# including uvicorn's own access/error logs — goes through the JSON
-# formatter.
+# below), so every log emitted through this application's own `logging`
+# module — request handling, service-layer logging, etc. — goes through
+# the JSON formatter. This does NOT cover uvicorn's own access/error logs:
+# uvicorn attaches its own handlers directly to the `uvicorn`/`uvicorn.access`
+# loggers with propagate=False, so those bypass the root logger entirely
+# and print in uvicorn's default format.
 configure_logging(settings)
 logger = logging.getLogger(__name__)
 
