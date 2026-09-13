@@ -19,6 +19,20 @@ _HOSTNAME_RE = re.compile(rf"^{_HOSTNAME_LABEL}(\.{_HOSTNAME_LABEL})*$")
 # NmapPortScanner). Checked outright, before any format-specific parsing.
 _FORBIDDEN_CHARS_RE = re.compile(r"[;|&`$<>'\"\s\x00-\x1f\x7f]")
 
+# A value made up solely of digits, dots, and hyphens is exactly the shape of
+# an nmap-syntax octet range/list ("172.18.0.2-4", "1-254",
+# "10.0.0.1-10.0.0.5") even though `_HOSTNAME_RE` above accepts it as a
+# syntactically valid hostname label sequence. Any such value that isn't a
+# plain, single, parseable IP address must be rejected for hostname/domain
+# targets - otherwise it sails past the CIDR-only range check in
+# app.workers.tasks and reaches nmap, whose own target-syntax parser expands
+# the range into multiple hosts from what the system believes is one
+# authorized target. Genuine hostnames contain at least one letter and are
+# unaffected; the intentionally-supported IP-shaped-hostname case (e.g.
+# "192.168.1.1" submitted with target_type=hostname) still passes because it
+# *does* parse as a plain IP address.
+_DIGITS_DOTS_HYPHENS_RE = re.compile(r"^[0-9.\-]+$")
+
 
 class TargetBase(BaseModel):
     # target_type is declared before value so that, in subclasses adding a
@@ -69,6 +83,16 @@ class TargetCreate(TargetBase):
         elif target_type in (TargetType.DOMAIN, TargetType.HOSTNAME):
             if len(value) > 253 or not _HOSTNAME_RE.fullmatch(value):
                 raise ValueError(f"'{value}' is not a valid hostname/domain")
+            if _DIGITS_DOTS_HYPHENS_RE.match(value):
+                try:
+                    ipaddress.ip_address(value)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"'{value}' looks like an nmap host-range/list expression "
+                        "(digits, dots, and hyphens only) rather than a plain "
+                        "hostname or IP address; range/list scan targets are not "
+                        "supported"
+                    ) from exc
 
         return value
 

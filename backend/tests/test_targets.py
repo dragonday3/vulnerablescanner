@@ -209,3 +209,31 @@ def test_create_target_rejects_various_shell_metacharacters(client: TestClient, 
     resp = _create_target(client, project["id"], value, "hostname")
 
     assert resp.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("value", "target_type"),
+    [
+        # nmap host-range/list syntax: digits/dots/hyphens only, matches the
+        # hostname-label regex character class but is NOT a single
+        # parseable IP address. Left unblocked, this reaches
+        # NmapPortScanner's argv untouched (target_type isn't CIDR, so the
+        # CIDR-only range check in app.workers.tasks never sees it) and
+        # nmap's own target-syntax parser expands it into multiple hosts -
+        # the exact bug this test guards against (Finding 1).
+        ("172.18.0.2-4", "hostname"),
+        ("1-254", "hostname"),
+        ("10.0.0.1-10.0.0.5", "hostname"),
+        ("172.18.0.2-4", "domain"),
+        ("1-254", "domain"),
+        ("10.0.0.1-10.0.0.5", "domain"),
+    ],
+)
+def test_create_target_rejects_nmap_host_range_syntax(
+    client: TestClient, value: str, target_type: str
+) -> None:
+    project = _create_project(client)
+
+    resp = _create_target(client, project["id"], value, target_type)
+
+    assert resp.status_code == 422, resp.text

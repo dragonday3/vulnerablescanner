@@ -82,10 +82,23 @@ class NmapPortScanner:
         # host that was actually scanned (even one found down after a ping
         # probe) still gets a `<host>` element, so this check only catches
         # the "no scan happened" case, not a genuine down-host result.
-        if root.find("host") is None:
+        #
+        # This must also assert the other direction: nmap's own target-syntax
+        # parser accepts octet ranges/lists ("172.18.0.2-4") and CIDR-like
+        # forms, and will happily scan MULTIPLE hosts for what the caller
+        # believes is a single authorized target. Target.value is validated
+        # upstream to reject exactly that shape (see app.schemas.target), but
+        # this adapter is the layer that actually emits packets - it must not
+        # rely solely on that validator holding. Assert exactly one <host>
+        # element so a future regression in the validator fails loudly here
+        # (the scan lands in FAILED) instead of silently scanning multiple
+        # hosts and collapsing their services into one Asset row.
+        hosts = root.findall("host")
+        if len(hosts) != 1:
             raise NmapScanError(
-                f"nmap reported zero hosts scanned for {host!r} despite exiting 0 "
-                f"(target likely unresolvable or rejected): "
+                f"nmap scanned {len(hosts)} hosts for {host!r}, expected exactly 1 "
+                "(target value likely expands to a host range/list, which is not "
+                "permitted for a single-target scan): "
                 f"stdout={result.stdout!r} stderr={result.stderr!r}"
             )
 

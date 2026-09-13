@@ -1,5 +1,7 @@
 import shutil
 import socket
+import subprocess
+from unittest.mock import patch
 
 import pytest
 
@@ -79,6 +81,60 @@ def test_raises_on_unresolvable_host_instead_of_returning_empty_list() -> None:
 
     with pytest.raises(NmapScanError):
         scanner.scan("this-host-does-not-exist.invalid.", [80], timeout_seconds=30.0)
+
+
+_MULTI_HOST_XML = """<?xml version="1.0"?>
+<nmaprun>
+  <host>
+    <address addr="172.18.0.2" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="open"/>
+      </port>
+    </ports>
+  </host>
+  <host>
+    <address addr="172.18.0.3" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="80">
+        <state state="open"/>
+      </port>
+    </ports>
+  </host>
+  <host>
+    <address addr="172.18.0.4" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="443">
+        <state state="open"/>
+      </port>
+    </ports>
+  </host>
+  <runstats><hosts up="3" down="0" total="3"/></runstats>
+</nmaprun>
+"""
+
+
+def test_raises_on_multi_host_result_instead_of_collapsing_into_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 1 (Critical): nmap's own target-syntax parser accepts
+    host-range/list expressions ("172.18.0.2-4") and will scan MULTIPLE
+    hosts for what the caller believes is a single authorized target. This
+    adapter must not silently collapse those hosts' services into one
+    result - it must raise, even if a range-shaped value somehow reaches it
+    (e.g. a future regression in the upstream Target validator). Simulated
+    here via a mocked `subprocess.run` returning crafted multi-<host> XML,
+    since safely provisioning 3 real distinct hosts in a test environment
+    is impractical.
+    """
+    fake_result = subprocess.CompletedProcess(
+        args=["nmap"], returncode=0, stdout=_MULTI_HOST_XML, stderr=""
+    )
+    scanner = NmapPortScanner()
+
+    with patch("subprocess.run", return_value=fake_result):
+        with pytest.raises(NmapScanError, match="scanned 3 hosts"):
+            scanner.scan("172.18.0.2-4", [22, 80, 443], timeout_seconds=30.0)
 
 
 def test_import_has_no_side_effects() -> None:
