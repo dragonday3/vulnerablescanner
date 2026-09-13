@@ -40,19 +40,31 @@ def create_scan(db: Session, data: ScanCreate) -> Scan:
     db.commit()
     db.refresh(scan)
 
-    # Enqueue the actual work. Deliberately NOT wrapped in try/except: if
-    # the broker is unreachable, this raises and propagates as an unhandled
-    # exception (FastAPI's default 500) rather than a DB error - there's no
-    # existing handler for it and none is added here (see task-7 report for
-    # reasoning). The scan row above is already committed at CREATED, so a
-    # failure here leaves it sitting at CREATED rather than half-written;
-    # that's a known, acceptable-for-now gap (no automatic requeue/cleanup
-    # in this phase).
-    result = run_scan_task.delay(str(scan.id))
-    scan.celery_task_id = result.id
+    # Pre-generate the Celery task id and commit `celery_task_id` +
+    # `status=QUEUED` to the DB *before* dispatching the task, so the worker
+    # can never begin (and write its own status transition) before QUEUED is
+    # durably committed. Dispatching first (the original approach) raced: if
+    # the worker picked up the task and wrote e.g. COMPLETED/FAILED before
+    # this function's own subsequent commit landed, that commit would
+    # clobber the worker's write back to QUEUED, silently reverting an
+    # already-finished scan. Assigning the id ourselves (rather than reading
+    # it off `AsyncResult.id` after dispatch) is what makes committing first
+    # possible at all.
+    task_id = str(uuid.uuid4())
+    scan.celery_task_id = task_id
     scan.status = ScanStatus.QUEUED
     db.commit()
     db.refresh(scan)
+
+    # Deliberately NOT wrapped in try/except: if the broker is unreachable,
+    # this raises and propagates as an unhandled exception (FastAPI's
+    # default 500) rather than a DB error - there's no existing handler for
+    # it and none is added here (see task-7 report for reasoning). The scan
+    # row above is already committed at QUEUED with a task id that will
+    # never actually run, so a failure here leaves it stuck at QUEUED; that's
+    # a known, acceptable-for-now gap (no automatic requeue/cleanup in this
+    # phase), same as the previously-accepted CREATED-stuck gap this replaces.
+    run_scan_task.apply_async(args=[str(scan.id)], task_id=task_id)
     return scan
 
 

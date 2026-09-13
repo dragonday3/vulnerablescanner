@@ -67,12 +67,6 @@ from app.workers.tasks import run_scan_task  # noqa: E402
 
 test_engine: Engine = create_engine(TEST_DATABASE_URL)
 
-# Used by the autouse mock below as the fake Celery task id every mocked
-# `POST /scans` call gets. Exposed here (not just inside the fixture) so
-# tests that assert on it (e.g. a cancel test checking `revoke` was called
-# with the right id) can import it instead of duplicating the literal.
-FAKE_CELERY_TASK_ID = "fake-celery-task-id-0000"
-
 
 def _ensure_database_exists(url: str) -> None:
     """Create the target Postgres database on the server if missing."""
@@ -127,24 +121,28 @@ def client(db: Session) -> Generator[TestClient, None, None]:
 
 
 @pytest.fixture(autouse=True)
-def mock_run_scan_task_delay() -> Generator[MagicMock, None, None]:
+def mock_run_scan_task_apply_async() -> Generator[MagicMock, None, None]:
     """Global safety net, not just a test_scans.py concern: ANY test that
     goes through `POST /scans` (e.g. test_projects.py's cascade-delete test,
     not only test_scans.py itself) now indirectly calls
-    `run_scan_task.delay(...)`, which — unmocked — really publishes to the
-    Redis broker configured by REDIS_URL and gets picked up by whatever real
-    Celery worker is listening (a live `docker compose` worker in dev, for
-    instance). That's a real cross-process side effect a unit test suite
+    `run_scan_task.apply_async(...)`, which — unmocked — really publishes to
+    the Redis broker configured by REDIS_URL and gets picked up by whatever
+    real Celery worker is listening (a live `docker compose` worker in dev,
+    for instance). That's a real cross-process side effect a unit test suite
     must not have: it's slow, non-hermetic, and leaves the worker logging
     "scan not found" for a scan row that a moment later gets rolled back by
     this file's own savepoint-based test isolation. Autouse + defined here
     (not just in test_scans.py) ensures every test in the whole suite is
     covered, not just the ones that happen to know to ask for it.
+
+    `create_scan` now pre-generates the Celery task id itself (a `uuid4()`)
+    and commits it to the DB before ever calling `apply_async` (see the
+    lost-update-race fix in `scan_service.create_scan`), so this mock no
+    longer needs to fabricate a fake id via a fake `AsyncResult` - it only
+    needs to swallow the call so it never reaches the real broker.
     """
-    fake_result = MagicMock()
-    fake_result.id = FAKE_CELERY_TASK_ID
-    with patch.object(run_scan_task, "delay", return_value=fake_result) as mock_delay:
-        yield mock_delay
+    with patch.object(run_scan_task, "apply_async") as mock_apply_async:
+        yield mock_apply_async
 
 
 @pytest.fixture(autouse=True)
