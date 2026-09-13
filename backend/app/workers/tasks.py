@@ -2,6 +2,7 @@ import logging
 import uuid
 from datetime import UTC, datetime
 
+from app.core.logging import scan_id_var
 from app.db.session import SessionLocal
 from app.models.asset import Asset
 from app.models.scan import Scan, ScanStatus
@@ -50,6 +51,7 @@ def run_scan_task(scan_id: str) -> None:
     rather than silently stuck at `QUEUED`.
     """
     db = SessionLocal()
+    scan_id_token = None
     try:
         # Step 1: load the scan; handle the cancel-before-pickup race and a
         # missing row (e.g. deleted) by returning early, quietly.
@@ -60,6 +62,15 @@ def run_scan_task(scan_id: str) -> None:
         if scan.status == ScanStatus.CANCELLED:
             logger.info("run_scan_task: scan %s already cancelled, skipping", scan_id)
             return
+
+        # Bind scan_id onto every log line emitted for the rest of this
+        # task (JSONFormatter reads scan_id_var) so a failure's
+        # logger.exception(...) call below - and any other log line during
+        # this scan's run - can be correlated back to the scan. Reset in
+        # `finally` since Celery's prefork worker processes are long-lived
+        # and handle many tasks in sequence; leaving this set would leak
+        # this scan's id into the next task's log lines.
+        scan_id_token = scan_id_var.set(str(scan.id))
 
         # Step 2: RUNNING.
         scan.status = ScanStatus.RUNNING
@@ -122,6 +133,14 @@ def run_scan_task(scan_id: str) -> None:
             scan.completed_at = datetime.now(UTC)
             db.commit()
         except Exception as exc:
+            # A failure that happened mid-flush/commit (e.g. the Asset/
+            # Service persistence commit above) leaves the session's
+            # transaction invalidated - any further use, including the
+            # FAILED-transition commit below, raises PendingRollbackError
+            # unless we roll back first. Safe to call unconditionally: a
+            # failure from the adapter/dispatch code (no flush attempted)
+            # just rolls back an empty transaction.
+            db.rollback()
             # Step 8: log the full exception server-side before truncating
             # what goes in the DB column.
             logger.exception("run_scan_task: scan %s failed", scan_id)
@@ -130,4 +149,6 @@ def run_scan_task(scan_id: str) -> None:
             scan.completed_at = datetime.now(UTC)
             db.commit()
     finally:
+        if scan_id_token is not None:
+            scan_id_var.reset(scan_id_token)
         db.close()

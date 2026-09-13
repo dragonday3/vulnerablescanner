@@ -139,6 +139,37 @@ def test_scanner_exception_fails_scan_with_exception_message(
     assert db.execute(select(Asset).where(Asset.scan_id == scan.id)).first() is None
 
 
+def test_persistence_failure_rolls_back_and_reaches_failed(
+    db: Session, use_test_session: None
+) -> None:
+    """A DB-level failure during the Asset/Service persistence commit must
+    still land the scan at FAILED with a populated error_message, not
+    propagate as an unhandled error that leaves the scan stuck at
+    DISCOVERY forever. Guards against a real bug: the except block's own
+    commit previously failed with PendingRollbackError because the prior
+    failed flush left the session's transaction invalidated, and nothing
+    called db.rollback() first.
+
+    Forces a genuine DB-level failure (not a mocked one) by returning a
+    port number that overflows Postgres's 4-byte `integer` column
+    (`services.port`), so the failure happens inside SQLAlchemy's real
+    flush/commit machinery, exactly where the bug manifested.
+    """
+    scan = _make_scan(db, value="127.0.0.1")
+    # 2**31 is one past the max value a 4-byte Postgres `integer` can hold.
+    out_of_range_results = [PortScanResult(port=2**31, protocol="tcp", state="open")]
+
+    with patch.object(NativePortScanner, "scan", return_value=out_of_range_results):
+        tasks_module.run_scan_task(str(scan.id))
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.FAILED
+    assert scan.error_message  # non-empty; exact driver wording not asserted
+    assert scan.completed_at is not None
+
+    assert db.execute(select(Asset).where(Asset.scan_id == scan.id)).first() is None
+
+
 def test_unknown_scanner_config_fails_scan_without_crashing(
     db: Session, use_test_session: None
 ) -> None:
