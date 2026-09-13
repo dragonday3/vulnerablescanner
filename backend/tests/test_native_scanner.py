@@ -1,6 +1,8 @@
 import socket
 
-from app.modules.discovery.native_scanner import NativePortScanner
+import pytest
+
+from app.modules.discovery.native_scanner import NativePortScanner, NativeScanError
 
 
 def _free_port(listener: socket.socket) -> int:
@@ -47,6 +49,20 @@ def test_scan_returns_empty_list_when_nothing_open() -> None:
     results = scanner.scan("127.0.0.1", [closed_port], timeout_seconds=1.0)
 
     assert results == []
+
+
+def test_raises_on_unresolvable_host_instead_of_returning_empty_list() -> None:
+    # Finding 2: asyncio.open_connection's per-port DNS resolution failure
+    # was previously swallowed by the blanket `except Exception` in
+    # `_probe`, so a scan of an unresolvable hostname "completed
+    # successfully" with an empty list - indistinguishable from "resolved
+    # fine, everything closed". Resolving once up front must now surface
+    # this as a raised error instead, mirroring NmapPortScanner's
+    # equivalent "never actually scanned" semantics.
+    scanner = NativePortScanner()
+
+    with pytest.raises(NativeScanError):
+        scanner.scan("this-host-does-not-exist.invalid.", [80], timeout_seconds=1.0)
 
 
 def test_import_has_no_side_effects() -> None:
