@@ -16,14 +16,17 @@ import xml.etree.ElementTree as ET
 from app.modules.discovery.interfaces import PortScanResult
 
 DEFAULT_TOP_PORTS = 1000
+OPEN_STATE = "open"
 
 
 class NmapScanError(RuntimeError):
-    """Raised when nmap fails to run or its output can't be parsed.
+    """Raised when nmap fails to run, produces unparseable output, or never
+    actually scanned the target.
 
-    Distinguishes a real failure (non-zero exit, unparseable XML) from a
-    genuine "scanned successfully, found nothing open" result, which is
-    returned as an empty list instead.
+    Distinguishes a real failure (non-zero exit, unparseable XML, or an
+    exit-0 run that scanned zero hosts - e.g. an unresolvable hostname)
+    from a genuine "scanned successfully, found nothing open" result,
+    which is returned as an empty list instead.
     """
 
 
@@ -71,15 +74,32 @@ class NmapPortScanner:
                 f"stdout={result.stdout!r} stderr={result.stderr!r}"
             ) from exc
 
+        # nmap can exit 0 while having scanned zero hosts - e.g. an
+        # unresolvable hostname ("Failed to resolve ...") or a target it
+        # rejects as invalid syntax. Both produce `<hosts up="0" down="0"
+        # total="0"/>` and no `<host>` element at all, which would otherwise
+        # look identical to a real "scanned fine, nothing open" result. A
+        # host that was actually scanned (even one found down after a ping
+        # probe) still gets a `<host>` element, so this check only catches
+        # the "no scan happened" case, not a genuine down-host result.
+        if root.find("host") is None:
+            raise NmapScanError(
+                f"nmap reported zero hosts scanned for {host!r} despite exiting 0 "
+                f"(target likely unresolvable or rejected): "
+                f"stdout={result.stdout!r} stderr={result.stderr!r}"
+            )
+
         scan_results: list[PortScanResult] = []
         for port_el in root.iter("port"):
             state_el = port_el.find("state")
-            if state_el is None or state_el.get("state") != "open":
+            if state_el is None or state_el.get("state") != OPEN_STATE:
                 continue
             portid = port_el.get("portid")
             protocol = port_el.get("protocol")
             if portid is None or protocol is None:
                 continue
-            scan_results.append(PortScanResult(port=int(portid), protocol=protocol, state="open"))
+            scan_results.append(
+                PortScanResult(port=int(portid), protocol=protocol, state=OPEN_STATE)
+            )
 
         return scan_results

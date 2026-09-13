@@ -68,6 +68,19 @@ def test_raises_on_nmap_failure_instead_of_returning_empty_list() -> None:
         scanner.scan("127.0.0.1", [99999], timeout_seconds=30.0)
 
 
+def test_raises_on_unresolvable_host_instead_of_returning_empty_list() -> None:
+    # nmap exits 0 on an unresolvable hostname ("Failed to resolve ...") but
+    # scans zero hosts (`<hosts up="0" down="0" total="0"/>`, no <host>
+    # element at all). That must raise, not be conflated with a genuine
+    # "scanned fine, nothing open" empty-list result - otherwise a
+    # decommissioned host or typo'd hostname would silently report as
+    # "scanned, zero services" instead of "scan didn't actually happen".
+    scanner = NmapPortScanner()
+
+    with pytest.raises(NmapScanError):
+        scanner.scan("this-host-does-not-exist.invalid.", [80], timeout_seconds=30.0)
+
+
 def test_import_has_no_side_effects() -> None:
     # Importing the module must not run any subprocess; presence of this
     # test - and the module having already been imported at collection time
