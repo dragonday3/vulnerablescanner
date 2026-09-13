@@ -91,6 +91,22 @@ def run_scan_task(scan_id: str) -> None:
             db.commit()
             return
 
+        # Defense-in-depth: re-check authorization here too, not just at
+        # scan-creation time (scan_service.create_scan). This worker process
+        # is the one that actually emits network traffic, potentially much
+        # later and always in a separate transaction from creation - if
+        # authorization is revoked (the Target row's
+        # `authorization_confirmed` flipped to False) after a scan was
+        # queued but before the worker picks it up, this is the only check
+        # standing between that revocation and a scan actually running
+        # against a no-longer-authorized target.
+        if target.authorization_confirmed is not True:
+            scan.status = ScanStatus.FAILED
+            scan.error_message = "Target authorization is not confirmed"
+            scan.completed_at = datetime.now(UTC)
+            db.commit()
+            return
+
         # Steps 5-7: adapter selection, the scan itself, and persisting
         # results are all wrapped in one try/except so any failure —
         # unknown scanner name, a raised scanner exception, a DB error while

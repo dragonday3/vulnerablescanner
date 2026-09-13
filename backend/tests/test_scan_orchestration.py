@@ -206,3 +206,34 @@ def test_already_cancelled_scan_returns_without_further_changes(
 def test_missing_scan_returns_without_error(db: Session, use_test_session: None) -> None:
     # No DB row for this id at all — must not raise.
     tasks_module.run_scan_task(str(uuid.uuid4()))
+
+
+def test_authorization_revoked_after_queueing_fails_scan_without_scanning(
+    db: Session, use_test_session: None
+) -> None:
+    """Finding 6: `create_scan` only checks `target.authorization_confirmed`
+    at scan-creation time. The worker runs later, in its own transaction,
+    and is the process that actually emits network traffic - it must
+    re-check authorization itself rather than trusting a check that may be
+    stale by the time it runs.
+
+    Simulated the same way `test_scans.py`'s
+    `test_create_scan_rejected_for_target_with_authorization_revoked` does:
+    flip the DB column directly (bypassing the API/validator, which can't
+    catch this after the fact) between scan creation and task execution.
+    """
+    scan = _make_scan(db, value="127.0.0.1")
+    scan.target.authorization_confirmed = False
+    db.commit()
+
+    with patch.object(NativePortScanner, "scan") as mock_scan:
+        tasks_module.run_scan_task(str(scan.id))
+
+    mock_scan.assert_not_called()
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.FAILED
+    assert scan.error_message == "Target authorization is not confirmed"
+    assert scan.completed_at is not None
+
+    assert db.execute(select(Asset).where(Asset.scan_id == scan.id)).first() is None
