@@ -117,6 +117,20 @@ next lint
    that lets you choose "UTF-8" (no BOM) explicitly, or `cp .env.example
    .env` as above and edit values without re-saving through Notepad's
    default encoding.
+6. **Turbopack route-discovery bug under Windows Docker bind mounts.**
+   `frontend/package.json`'s `dev` and `build` scripts both pass
+   `--webpack`, forcing the classic webpack bundler instead of Next 16's
+   default Turbopack. Without it, a route nested two dynamic segments deep
+   under a static path segment (e.g.
+   `/projects/[projectId]/scans/[scanId]`) 404s on every request — even on
+   a fully cold start with no cache — and the route is missing from
+   `next dev`'s own auto-generated `.next/types/routes.d.ts` too, which
+   points at a route-discovery bug rather than a dev-server/HMR quirk.
+   This matches known upstream Turbopack/Next 16 issues with nested dynamic
+   routes on Windows Docker bind mounts (inotify file-watch events not
+   propagating into the container). If a future Next/Turbopack upgrade
+   fixes this, both `--webpack` flags can likely be dropped — reverify the
+   affected route still resolves under Turbopack first.
 
 ## Responsible Use
 

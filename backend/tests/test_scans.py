@@ -5,7 +5,9 @@ from unittest.mock import MagicMock
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
+from app.models.asset import Asset
 from app.models.scan import Scan, ScanStatus
+from app.models.service import Service
 from app.models.target import Target
 
 # `mock_run_scan_task_apply_async` and `mock_celery_control_revoke`
@@ -269,3 +271,98 @@ def test_cancel_still_succeeds_when_revoke_raises(
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "cancelled"
+
+
+def test_get_scan_assets_returns_nested_assets_and_services_with_fingerprint_fields(
+    client: TestClient, db: Session
+) -> None:
+    """The core contract of Task 5's new endpoint: a scan's assets, each with
+    their nested services, come back with the Phase 3 fingerprint fields
+    (product/version/extrainfo/fingerprint_source/evidence) intact - not just
+    present as schema fields but actually round-tripping real, non-None
+    values through the DB -> ORM -> Pydantic -> JSON pipeline.
+    """
+    ctx = _create_authorized_target(client)
+    scan = _create_scan(client, ctx)
+
+    asset = Asset(
+        project_id=uuid.UUID(ctx["project"]["id"]),
+        target_id=uuid.UUID(ctx["target"]["id"]),
+        scan_id=uuid.UUID(scan["id"]),
+        host="10.0.0.10",
+    )
+    db.add(asset)
+    db.flush()
+
+    fingerprinted_service = Service(
+        asset_id=asset.id,
+        port=443,
+        protocol="tcp",
+        state="open",
+        service_name="https",
+        product="nginx",
+        version="1.24.0",
+        extrainfo="Ubuntu",
+        fingerprint_source="nmap-sv",
+        evidence={"cpe": ["cpe:/a:nginx:nginx:1.24.0"], "raw": "nginx/1.24.0"},
+    )
+    bare_service = Service(
+        asset_id=asset.id,
+        port=22,
+        protocol="tcp",
+        state="open",
+        service_name="ssh",
+    )
+    db.add_all([fingerprinted_service, bare_service])
+    db.commit()
+
+    resp = client.get(f"/api/v1/scans/{scan['id']}/assets")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    asset_body = body[0]
+    assert asset_body["id"] == str(asset.id)
+    assert asset_body["project_id"] == ctx["project"]["id"]
+    assert asset_body["target_id"] == ctx["target"]["id"]
+    assert asset_body["scan_id"] == scan["id"]
+    assert asset_body["host"] == "10.0.0.10"
+    assert len(asset_body["services"]) == 2
+
+    services_by_port = {s["port"]: s for s in asset_body["services"]}
+    fingerprinted = services_by_port[443]
+    assert fingerprinted["service_name"] == "https"
+    assert fingerprinted["product"] == "nginx"
+    assert fingerprinted["version"] == "1.24.0"
+    assert fingerprinted["extrainfo"] == "Ubuntu"
+    assert fingerprinted["fingerprint_source"] == "nmap-sv"
+    assert fingerprinted["evidence"] == {
+        "cpe": ["cpe:/a:nginx:nginx:1.24.0"],
+        "raw": "nginx/1.24.0",
+    }
+
+    bare = services_by_port[22]
+    assert bare["service_name"] == "ssh"
+    assert bare["product"] is None
+    assert bare["version"] is None
+    assert bare["extrainfo"] is None
+    assert bare["fingerprint_source"] is None
+    assert bare["evidence"] is None
+
+
+def test_get_scan_assets_returns_404_for_nonexistent_scan(client: TestClient) -> None:
+    resp = client.get(f"/api/v1/scans/{uuid.uuid4()}/assets")
+
+    assert resp.status_code == 404
+
+
+def test_get_scan_assets_returns_empty_list_for_scan_with_no_assets_yet(
+    client: TestClient,
+) -> None:
+    ctx = _create_authorized_target(client)
+    scan = _create_scan(client, ctx)
+
+    resp = client.get(f"/api/v1/scans/{scan['id']}/assets")
+
+    assert resp.status_code == 200
+    assert resp.json() == []

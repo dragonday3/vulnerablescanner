@@ -12,6 +12,7 @@ from app.modules.discovery.common_ports import COMMON_PORTS, PORT_NAMES
 from app.modules.discovery.interfaces import PortScannerInterface
 from app.modules.discovery.native_scanner import NativePortScanner
 from app.modules.discovery.nmap_scanner import NmapPortScanner
+from app.modules.fingerprinting.http_prober import WEB_PORTS, probe_services
 from app.workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -21,13 +22,55 @@ logger = logging.getLogger(__name__)
 # scan profile fast/low-noise, while the nmap adapter needs a much larger
 # *overall* subprocess timeout since it scans up to 1000 ports in one
 # invocation ("a sane overall timeout, e.g. 120s" per the plan).
+#
+# Re-measured 2026-09-17 (Phase 3, PLAN_3.md #2) after adding `-sV` to the
+# nmap invocation, since service/version probing is meaningfully slower than
+# a bare `-sT` connect scan. Real top-1000-port `-sV` scans from inside the
+# `backend` container against in-network Docker Compose targets observed:
+# a single real service (postgres:5432 ~6.5s, backend:8000/uvicorn ~11.4s),
+# and a synthetic 11-open-port host (10 bare listeners + the real uvicorn
+# service on 8000) at ~11.5s total - worst observed wall-clock was ~11.5s.
+# 2-3x headroom on that measurement is under 35s, well below the fixed
+# floor the plan calls for, so the floor wins: 180.0s (up from 120.0s).
 NATIVE_SCAN_TIMEOUT_SECONDS = 1.5
-NMAP_SCAN_TIMEOUT_SECONDS = 120.0
+NMAP_SCAN_TIMEOUT_SECONDS = 180.0
 
 # Error-message column truncation guard (Task 6 brief step 8): a huge
 # traceback-derived string must never blow out the `error_message` Text
 # column's practical size.
 MAX_ERROR_MESSAGE_LENGTH = 2000
+
+# Bounded-varchar column truncation guards (final-review fix wave, PLAN_3.md
+# #2). `Service.service_name`/`product`/`version` are `String(50)`/
+# `String(255)`/`String(100)` columns (see app.models.service) populated
+# from remote, attacker-influenced input on two independent write paths:
+# nmap's `-sV` XML `<service>` attributes, and the HTTP prober's parsed
+# `Server` response header. Neither source is length-bounded in principle,
+# and an over-length value raises a Postgres `StringDataRightTruncation`
+# error on commit. On the HTTP path that happens inside this module's
+# fingerprinting try/except, which rolls back and swallows the exception by
+# design ("never fail the scan") — meaning one oversized `Server` header
+# would otherwise silently discard the *entire* HTTP enrichment pass for
+# every port, not just the offending one. On the nmap path it would fail
+# the whole scan to FAILED. Clamping at the write site (mirroring the
+# existing `str(exc)[:MAX_ERROR_MESSAGE_LENGTH]` pattern immediately below)
+# avoids both outcomes. `evidence` (JSONB) and `extrainfo` (Text) are
+# deliberately NOT clamped — they have no meaningful length limit and must
+# stay verbatim (Global Constraint 9: raw evidence preserved verbatim).
+MAX_SERVICE_NAME_LENGTH = 50
+MAX_PRODUCT_LENGTH = 255
+MAX_VERSION_LENGTH = 100
+
+
+def _clamp(value: str | None, max_length: int) -> str | None:
+    """Clamp `value` to at most `max_length` characters, passing `None`
+    through unchanged. Used to keep remote, attacker-influenced strings
+    (nmap `-sV` output, HTTP `Server` headers) from ever overflowing a
+    bounded varchar column and raising a DB error on commit.
+    """
+    if value is None:
+        return None
+    return value[:max_length]
 
 
 @celery_app.task
@@ -138,15 +181,19 @@ def run_scan_task(scan_id: str) -> None:
                     port=result.port,
                     protocol=result.protocol,
                     state=result.state,
-                    service_name=PORT_NAMES.get(result.port),
+                    service_name=_clamp(
+                        result.service_name or PORT_NAMES.get(result.port),
+                        MAX_SERVICE_NAME_LENGTH,
+                    ),
+                    product=_clamp(result.product, MAX_PRODUCT_LENGTH),
+                    version=_clamp(result.version, MAX_VERSION_LENGTH),
+                    extrainfo=result.extrainfo,
+                    fingerprint_source="nmap-sv" if scanner_name == "nmap" else None,
+                    evidence=result.raw_evidence,
                 )
                 for result in results
             ]
             db.add_all([asset, *services])
-            db.commit()
-
-            scan.status = ScanStatus.COMPLETED
-            scan.completed_at = datetime.now(UTC)
             db.commit()
         except Exception as exc:
             # A failure that happened mid-flush/commit (e.g. the Asset/
@@ -164,6 +211,56 @@ def run_scan_task(scan_id: str) -> None:
             scan.error_message = str(exc)[:MAX_ERROR_MESSAGE_LENGTH]
             scan.completed_at = datetime.now(UTC)
             db.commit()
+            # Explicit return: without this, a discovery failure (correctly
+            # committed as FAILED above) would otherwise fall through into
+            # the FINGERPRINTING/COMPLETED code below and get incorrectly
+            # overwritten, since this except block is no longer the last
+            # statement in the function (Phase 3, PLAN_3.md #4).
+            return
+
+        # Step 8 (Phase 3): FINGERPRINTING. Committed uniformly for both
+        # adapters, even nmap-adapter scans (whose evidence is already
+        # complete from the `-sV` pass above) — this keeps the state machine
+        # adapter-agnostic for future phases. `services` (built above) are
+        # still attached, in-session ORM objects, reused directly below with
+        # no re-query needed.
+        scan.status = ScanStatus.FINGERPRINTING
+        db.commit()
+
+        # Step 9 (Phase 3): native-only HTTP enrichment, a second best-effort
+        # pass over the already-persisted Service rows. Its own independent
+        # try/except: fingerprinting failures must never fail the scan, so on
+        # any exception here we roll back, log, and fall through to
+        # COMPLETED regardless — no scan.status mutation, no return.
+        try:
+            if scanner_name == "native":
+                web_ports = [s.port for s in services if s.port in WEB_PORTS]
+                if web_ports:
+                    probe_results = probe_services(target.value, web_ports)
+                    for service in services:
+                        probe = probe_results.get(service.port)
+                        if probe is None:
+                            continue
+                        service.product = _clamp(probe.product, MAX_PRODUCT_LENGTH)
+                        service.version = _clamp(probe.version, MAX_VERSION_LENGTH)
+                        service.extrainfo = probe.extrainfo
+                        service.fingerprint_source = "http"
+                        service.evidence = {
+                            "scheme": probe.scheme,
+                            "status_code": probe.status_code,
+                            "server": probe.server_header,
+                            "title": probe.title,
+                            "headers": probe.headers,
+                        }
+                    db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("run_scan_task: scan %s HTTP fingerprinting failed", scan_id)
+
+        # Step 10: unchanged.
+        scan.status = ScanStatus.COMPLETED
+        scan.completed_at = datetime.now(UTC)
+        db.commit()
     finally:
         if scan_id_token is not None:
             scan_id_var.reset(scan_id_token)

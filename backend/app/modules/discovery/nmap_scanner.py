@@ -42,7 +42,12 @@ class NmapPortScanner:
         # List-form argv only - never shell=True, never a string-interpolated
         # command - so `host` can never be interpreted as shell syntax even
         # though Task 1 already guarantees its shape.
-        cmd = ["nmap", "-sT", *port_args, "-oX", "-", host]
+        # `-sV` (service/version detection) is added unconditionally as of
+        # Phase 3: it runs additional protocol probes against every port
+        # nmap already found open, in the same subprocess invocation, and
+        # its XML output gains a <service> child element (and <cpe> entries)
+        # per <port> that this adapter now parses below.
+        cmd = ["nmap", "-sT", "-sV", *port_args, "-oX", "-", host]
 
         try:
             result = subprocess.run(
@@ -111,8 +116,57 @@ class NmapPortScanner:
             protocol = port_el.get("protocol")
             if portid is None or protocol is None:
                 continue
+
+            # `-sV` adds an optional <service> child with name/product/
+            # version/extrainfo/method/conf attributes (nmap omits whichever
+            # of these it has no data for) plus zero or more <cpe> children.
+            # `service_el is None` just means nmap had nothing to say about
+            # this port - a normal outcome, not an error - so every new
+            # PortScanResult field simply stays at its dataclass default.
+            service_name = product = version = extrainfo = method = None
+            cpe: tuple[str, ...] = ()
+            raw_evidence: dict[str, object] | None = None
+
+            service_el = port_el.find("service")
+            if service_el is not None:
+                service_name = service_el.get("name")
+                product = service_el.get("product")
+                version = service_el.get("version")
+                extrainfo = service_el.get("extrainfo")
+                method = service_el.get("method")
+                conf = service_el.get("conf")
+                cpe = tuple(cpe_el.text for cpe_el in service_el.findall("cpe") if cpe_el.text)
+
+                evidence: dict[str, object] = {}
+                if service_name is not None:
+                    evidence["name"] = service_name
+                if product is not None:
+                    evidence["product"] = product
+                if version is not None:
+                    evidence["version"] = version
+                if extrainfo is not None:
+                    evidence["extrainfo"] = extrainfo
+                if method is not None:
+                    evidence["method"] = method
+                if conf is not None:
+                    evidence["conf"] = conf
+                if cpe:
+                    evidence["cpe"] = list(cpe)
+                raw_evidence = evidence or None
+
             scan_results.append(
-                PortScanResult(port=int(portid), protocol=protocol, state=OPEN_STATE)
+                PortScanResult(
+                    port=int(portid),
+                    protocol=protocol,
+                    state=OPEN_STATE,
+                    service_name=service_name,
+                    product=product,
+                    version=version,
+                    extrainfo=extrainfo,
+                    method=method,
+                    cpe=cpe,
+                    raw_evidence=raw_evidence,
+                )
             )
 
         return scan_results
