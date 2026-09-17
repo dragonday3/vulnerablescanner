@@ -26,6 +26,13 @@ class Asset(Base):
     host: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+    # order_by="Service.port": without it, services come back in arbitrary
+    # (heap) order, and since the native-enrichment pass UPDATEs rows in
+    # place (see app.workers.tasks), fingerprinted ports would visibly
+    # reorder in the frontend table after a scan completes.
     services: Mapped[list["Service"]] = relationship(
-        back_populates="asset", cascade="all, delete-orphan", passive_deletes=True
+        back_populates="asset",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="Service.port",
     )
