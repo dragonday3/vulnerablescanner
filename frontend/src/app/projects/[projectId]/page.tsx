@@ -193,7 +193,12 @@ export default async function ProjectDetailPage({
                   {scans.map((scan) => (
                     <tr key={scan.id} className="hover:bg-zinc-50">
                       <td className="px-4 py-3 font-mono text-xs text-zinc-600">
-                        {shortId(scan.id)}
+                        <Link
+                          href={`/projects/${projectId}/scans/${scan.id}`}
+                          className="font-mono text-xs text-zinc-600 hover:underline"
+                        >
+                          {shortId(scan.id)}
+                        </Link>
                       </td>
                       <td className="px-4 py-3 text-zinc-900">
                         {targetById.get(scan.target_id)?.value ?? (
