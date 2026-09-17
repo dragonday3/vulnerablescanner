@@ -31,6 +31,8 @@ from app.models.target import Target, TargetType
 from app.modules.discovery.common_ports import PORT_NAMES
 from app.modules.discovery.interfaces import PortScanResult
 from app.modules.discovery.native_scanner import NativePortScanner
+from app.modules.discovery.nmap_scanner import NmapPortScanner
+from app.modules.fingerprinting.http_prober import HttpProbeResult
 from app.workers import tasks as tasks_module
 
 
@@ -237,3 +239,251 @@ def test_authorization_revoked_after_queueing_fails_scan_without_scanning(
     assert scan.completed_at is not None
 
     assert db.execute(select(Asset).where(Asset.scan_id == scan.id)).first() is None
+
+
+# --- Phase 3: FINGERPRINTING transition + evidence persistence + native HTTP enrichment ---
+
+
+def test_nmap_path_persists_evidence_fields(db: Session, use_test_session: None) -> None:
+    """nmap's own `-sV` evidence (product/version/extrainfo/raw_evidence)
+    must land on the persisted Service row with fingerprint_source="nmap-sv",
+    and nmap's own service-name guess must win over the PORT_NAMES fallback
+    when nmap supplies one (the Phase 3 precedence flip) - while a result
+    with no service_name guess still falls back to PORT_NAMES as before.
+    """
+    scan = _make_scan(db, value="127.0.0.1", config={"scanner": "nmap"})
+    fake_results = [
+        PortScanResult(
+            port=443,
+            protocol="tcp",
+            state="open",
+            service_name="https",
+            product="nginx",
+            version="1.24.0",
+            extrainfo="Ubuntu",
+            method="probed",
+            cpe=("cpe:/a:nginx:nginx:1.24.0",),
+            raw_evidence={"name": "https", "product": "nginx", "version": "1.24.0"},
+        ),
+        # No service_name guess from nmap for this one -> falls back to
+        # PORT_NAMES, exactly like the pre-Phase-3 behavior.
+        PortScanResult(port=22, protocol="tcp", state="open"),
+    ]
+
+    with patch.object(NmapPortScanner, "scan", return_value=fake_results) as mock_scan:
+        tasks_module.run_scan_task(str(scan.id))
+
+    mock_scan.assert_called_once()
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.COMPLETED
+    assert scan.error_message is None
+
+    asset = db.execute(select(Asset).where(Asset.scan_id == scan.id)).scalar_one()
+    services = {
+        s.port: s for s in db.execute(select(Service).where(Service.asset_id == asset.id)).scalars()
+    }
+
+    https_service = services[443]
+    assert https_service.service_name == "https"
+    assert https_service.product == "nginx"
+    assert https_service.version == "1.24.0"
+    assert https_service.extrainfo == "Ubuntu"
+    assert https_service.fingerprint_source == "nmap-sv"
+    assert https_service.evidence == {"name": "https", "product": "nginx", "version": "1.24.0"}
+
+    ssh_service = services[22]
+    assert ssh_service.service_name == PORT_NAMES.get(22)
+    assert ssh_service.product is None
+    assert ssh_service.fingerprint_source == "nmap-sv"
+    assert ssh_service.evidence is None
+
+
+def test_native_http_enrichment_updates_only_matching_web_port_service(
+    db: Session, use_test_session: None
+) -> None:
+    """Native-adapter scans get a second HTTP enrichment pass; only the
+    Service row whose port both (a) is in WEB_PORTS and (b) got a probe
+    result back should be updated - other discovered ports must be left
+    with fingerprint_source=None.
+    """
+    scan = _make_scan(db, value="127.0.0.1")
+    fake_results = [
+        PortScanResult(port=22, protocol="tcp", state="open"),
+        PortScanResult(port=80, protocol="tcp", state="open"),
+        PortScanResult(port=3306, protocol="tcp", state="open"),
+    ]
+    probe_result = HttpProbeResult(
+        port=80,
+        scheme="http",
+        status_code=200,
+        server_header="nginx/1.24.0",
+        product="nginx",
+        version="1.24.0",
+        extrainfo=None,
+        title="Welcome",
+        headers={"server": "nginx/1.24.0"},
+    )
+
+    with (
+        patch.object(NativePortScanner, "scan", return_value=fake_results),
+        patch.object(tasks_module, "probe_services", return_value={80: probe_result}) as mock_probe,
+    ):
+        tasks_module.run_scan_task(str(scan.id))
+
+    mock_probe.assert_called_once_with("127.0.0.1", [80])
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.COMPLETED
+    assert scan.error_message is None
+
+    asset = db.execute(select(Asset).where(Asset.scan_id == scan.id)).scalar_one()
+    services = {
+        s.port: s for s in db.execute(select(Service).where(Service.asset_id == asset.id)).scalars()
+    }
+
+    assert services[80].fingerprint_source == "http"
+    assert services[80].product == "nginx"
+    assert services[80].version == "1.24.0"
+    assert services[80].evidence == {
+        "scheme": "http",
+        "status_code": 200,
+        "server": "nginx/1.24.0",
+        "title": "Welcome",
+        "headers": {"server": "nginx/1.24.0"},
+    }
+
+    assert services[22].fingerprint_source is None
+    assert services[22].product is None
+    assert services[3306].fingerprint_source is None
+    assert services[3306].product is None
+
+
+def test_native_http_enrichment_failure_does_not_fail_scan(
+    db: Session, use_test_session: None
+) -> None:
+    """The single most important contract in this task: fingerprinting is
+    best-effort enrichment and must never be able to fail the scan. A
+    `probe_services` exception must be caught, logged, and rolled back -
+    the scan still reaches COMPLETED with error_message still None, and
+    the affected Service row's fingerprint fields stay unset.
+    """
+    scan = _make_scan(db, value="127.0.0.1")
+    fake_results = [PortScanResult(port=80, protocol="tcp", state="open")]
+
+    with (
+        patch.object(NativePortScanner, "scan", return_value=fake_results),
+        patch.object(
+            tasks_module, "probe_services", side_effect=RuntimeError("probe boom")
+        ) as mock_probe,
+    ):
+        tasks_module.run_scan_task(str(scan.id))
+
+    mock_probe.assert_called_once()
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.COMPLETED
+    assert scan.completed_at is not None
+    assert scan.error_message is None
+
+    asset = db.execute(select(Asset).where(Asset.scan_id == scan.id)).scalar_one()
+    service = db.execute(select(Service).where(Service.asset_id == asset.id)).scalar_one()
+    assert service.fingerprint_source is None
+    assert service.product is None
+    assert service.evidence is None
+
+
+def test_native_http_enrichment_skipped_when_no_discovered_ports_are_web_ports(
+    db: Session, use_test_session: None
+) -> None:
+    """`probe_services` must never be called at all when none of the
+    discovered open ports are in WEB_PORTS - no wasted work.
+    """
+    scan = _make_scan(db, value="127.0.0.1")
+    fake_results = [PortScanResult(port=22, protocol="tcp", state="open")]
+
+    with (
+        patch.object(NativePortScanner, "scan", return_value=fake_results),
+        patch.object(tasks_module, "probe_services") as mock_probe,
+    ):
+        tasks_module.run_scan_task(str(scan.id))
+
+    mock_probe.assert_not_called()
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.COMPLETED
+
+
+def test_discovery_failure_does_not_fall_through_to_fingerprinting_or_completed(
+    db: Session, use_test_session: None
+) -> None:
+    """Regression test for the explicit `return` added at the end of the
+    discovery `except` block. Once the FINGERPRINTING/enrichment/COMPLETED
+    code was added *after* that block instead of inside it, a
+    discovery-stage failure's correctly-committed FAILED status would -
+    without that `return` - fall straight through into the new code and
+    get silently overwritten to FINGERPRINTING and then COMPLETED.
+
+    Verified this is a genuine regression test (not a vacuous one) by
+    temporarily deleting the `return` in app/workers/tasks.py and
+    re-running this test: it fails with
+    `assert <ScanStatus.COMPLETED: 'completed'> == <ScanStatus.FAILED: 'failed'>`
+    (mock_probe.assert_not_called() also fails, since the fingerprinting
+    block runs and calls probe_services). Restoring the `return` makes it
+    pass again.
+    """
+    scan = _make_scan(db, value="127.0.0.1", config={"scanner": "masscan"})
+
+    with (
+        patch.object(NativePortScanner, "scan") as mock_scan,
+        patch.object(tasks_module, "probe_services") as mock_probe,
+    ):
+        tasks_module.run_scan_task(str(scan.id))
+
+    mock_scan.assert_not_called()
+    mock_probe.assert_not_called()
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.FAILED
+    assert scan.error_message == "Unknown scanner 'masscan'"
+    assert scan.completed_at is not None
+
+
+@pytest.mark.parametrize("scanner_name", ["native", "nmap"])
+def test_fingerprinting_is_reached_as_an_intermediate_status(
+    db: Session,
+    use_test_session: None,
+    monkeypatch: pytest.MonkeyPatch,
+    scanner_name: str,
+) -> None:
+    """FINGERPRINTING must actually be set (and committed) as an
+    intermediate state for both adapters, not skipped straight to
+    COMPLETED - including nmap-adapter scans, whose evidence is already
+    complete, since the state machine is deliberately adapter-agnostic.
+
+    Spies on `db.commit` to record `scan.status` at the moment of each
+    commit, since `run_scan_task` never returns the intermediate states -
+    it only leaves the final one behind for a post-hoc `db.refresh`.
+    """
+    scan = _make_scan(db, value="127.0.0.1", config={"scanner": scanner_name})
+    # Port 22 isn't in WEB_PORTS, so the native path's enrichment block is a
+    # no-op here (irrelevant to what this test is checking).
+    fake_results = [PortScanResult(port=22, protocol="tcp", state="open")]
+
+    observed_statuses: list[ScanStatus] = []
+    original_commit = db.commit
+
+    def spy_commit() -> None:
+        observed_statuses.append(scan.status)
+        original_commit()
+
+    monkeypatch.setattr(db, "commit", spy_commit)
+
+    adapter_cls = NativePortScanner if scanner_name == "native" else NmapPortScanner
+    with patch.object(adapter_cls, "scan", return_value=fake_results):
+        tasks_module.run_scan_task(str(scan.id))
+
+    assert ScanStatus.FINGERPRINTING in observed_statuses
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.COMPLETED

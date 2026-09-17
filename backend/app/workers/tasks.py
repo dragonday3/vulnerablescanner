@@ -12,6 +12,7 @@ from app.modules.discovery.common_ports import COMMON_PORTS, PORT_NAMES
 from app.modules.discovery.interfaces import PortScannerInterface
 from app.modules.discovery.native_scanner import NativePortScanner
 from app.modules.discovery.nmap_scanner import NmapPortScanner
+from app.modules.fingerprinting.http_prober import WEB_PORTS, probe_services
 from app.workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -148,15 +149,16 @@ def run_scan_task(scan_id: str) -> None:
                     port=result.port,
                     protocol=result.protocol,
                     state=result.state,
-                    service_name=PORT_NAMES.get(result.port),
+                    service_name=result.service_name or PORT_NAMES.get(result.port),
+                    product=result.product,
+                    version=result.version,
+                    extrainfo=result.extrainfo,
+                    fingerprint_source="nmap-sv" if scanner_name == "nmap" else None,
+                    evidence=result.raw_evidence,
                 )
                 for result in results
             ]
             db.add_all([asset, *services])
-            db.commit()
-
-            scan.status = ScanStatus.COMPLETED
-            scan.completed_at = datetime.now(UTC)
             db.commit()
         except Exception as exc:
             # A failure that happened mid-flush/commit (e.g. the Asset/
@@ -174,6 +176,56 @@ def run_scan_task(scan_id: str) -> None:
             scan.error_message = str(exc)[:MAX_ERROR_MESSAGE_LENGTH]
             scan.completed_at = datetime.now(UTC)
             db.commit()
+            # Explicit return: without this, a discovery failure (correctly
+            # committed as FAILED above) would otherwise fall through into
+            # the FINGERPRINTING/COMPLETED code below and get incorrectly
+            # overwritten, since this except block is no longer the last
+            # statement in the function (Phase 3, PLAN_3.md #4).
+            return
+
+        # Step 8 (Phase 3): FINGERPRINTING. Committed uniformly for both
+        # adapters, even nmap-adapter scans (whose evidence is already
+        # complete from the `-sV` pass above) — this keeps the state machine
+        # adapter-agnostic for future phases. `services` (built above) are
+        # still attached, in-session ORM objects, reused directly below with
+        # no re-query needed.
+        scan.status = ScanStatus.FINGERPRINTING
+        db.commit()
+
+        # Step 9 (Phase 3): native-only HTTP enrichment, a second best-effort
+        # pass over the already-persisted Service rows. Its own independent
+        # try/except: fingerprinting failures must never fail the scan, so on
+        # any exception here we roll back, log, and fall through to
+        # COMPLETED regardless — no scan.status mutation, no return.
+        try:
+            if scanner_name == "native":
+                web_ports = [s.port for s in services if s.port in WEB_PORTS]
+                if web_ports:
+                    probe_results = probe_services(target.value, web_ports)
+                    for service in services:
+                        probe = probe_results.get(service.port)
+                        if probe is None:
+                            continue
+                        service.product = probe.product
+                        service.version = probe.version
+                        service.extrainfo = probe.extrainfo
+                        service.fingerprint_source = "http"
+                        service.evidence = {
+                            "scheme": probe.scheme,
+                            "status_code": probe.status_code,
+                            "server": probe.server_header,
+                            "title": probe.title,
+                            "headers": probe.headers,
+                        }
+                    db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("run_scan_task: scan %s HTTP fingerprinting failed", scan_id)
+
+        # Step 10: unchanged.
+        scan.status = ScanStatus.COMPLETED
+        scan.completed_at = datetime.now(UTC)
+        db.commit()
     finally:
         if scan_id_token is not None:
             scan_id_var.reset(scan_id_token)
