@@ -1,6 +1,7 @@
-# Dev/CI-only tooling: test runner, HTTP test client, linters, formatter,
-# type checker. Not required to run the app itself — see requirements.txt
-# for runtime dependencies.
+# Dev/CI-only tooling: test runner, linters, formatter, type checker. Not
+# required to run the app itself — see requirements.txt for runtime
+# dependencies (httpx included — it moved there in Phase 3, since the HTTP
+# fingerprinting module now uses it at runtime, not just in tests).
 #
 # Install locally with:
 #   pip install -r requirements.txt -r requirements-dev.txt
@@ -12,7 +13,6 @@
 # tools from the running container.
 pytest~=9.1
 pytest-cov~=7.1
-httpx~=0.28
 ruff~=0.16
 black~=26.5
 mypy~=2.3
