@@ -40,6 +40,38 @@ NMAP_SCAN_TIMEOUT_SECONDS = 180.0
 # column's practical size.
 MAX_ERROR_MESSAGE_LENGTH = 2000
 
+# Bounded-varchar column truncation guards (final-review fix wave, PLAN_3.md
+# #2). `Service.service_name`/`product`/`version` are `String(50)`/
+# `String(255)`/`String(100)` columns (see app.models.service) populated
+# from remote, attacker-influenced input on two independent write paths:
+# nmap's `-sV` XML `<service>` attributes, and the HTTP prober's parsed
+# `Server` response header. Neither source is length-bounded in principle,
+# and an over-length value raises a Postgres `StringDataRightTruncation`
+# error on commit. On the HTTP path that happens inside this module's
+# fingerprinting try/except, which rolls back and swallows the exception by
+# design ("never fail the scan") — meaning one oversized `Server` header
+# would otherwise silently discard the *entire* HTTP enrichment pass for
+# every port, not just the offending one. On the nmap path it would fail
+# the whole scan to FAILED. Clamping at the write site (mirroring the
+# existing `str(exc)[:MAX_ERROR_MESSAGE_LENGTH]` pattern immediately below)
+# avoids both outcomes. `evidence` (JSONB) and `extrainfo` (Text) are
+# deliberately NOT clamped — they have no meaningful length limit and must
+# stay verbatim (Global Constraint 9: raw evidence preserved verbatim).
+MAX_SERVICE_NAME_LENGTH = 50
+MAX_PRODUCT_LENGTH = 255
+MAX_VERSION_LENGTH = 100
+
+
+def _clamp(value: str | None, max_length: int) -> str | None:
+    """Clamp `value` to at most `max_length` characters, passing `None`
+    through unchanged. Used to keep remote, attacker-influenced strings
+    (nmap `-sV` output, HTTP `Server` headers) from ever overflowing a
+    bounded varchar column and raising a DB error on commit.
+    """
+    if value is None:
+        return None
+    return value[:max_length]
+
 
 @celery_app.task
 def ping() -> str:
@@ -149,9 +181,12 @@ def run_scan_task(scan_id: str) -> None:
                     port=result.port,
                     protocol=result.protocol,
                     state=result.state,
-                    service_name=result.service_name or PORT_NAMES.get(result.port),
-                    product=result.product,
-                    version=result.version,
+                    service_name=_clamp(
+                        result.service_name or PORT_NAMES.get(result.port),
+                        MAX_SERVICE_NAME_LENGTH,
+                    ),
+                    product=_clamp(result.product, MAX_PRODUCT_LENGTH),
+                    version=_clamp(result.version, MAX_VERSION_LENGTH),
                     extrainfo=result.extrainfo,
                     fingerprint_source="nmap-sv" if scanner_name == "nmap" else None,
                     evidence=result.raw_evidence,
@@ -206,8 +241,8 @@ def run_scan_task(scan_id: str) -> None:
                         probe = probe_results.get(service.port)
                         if probe is None:
                             continue
-                        service.product = probe.product
-                        service.version = probe.version
+                        service.product = _clamp(probe.product, MAX_PRODUCT_LENGTH)
+                        service.version = _clamp(probe.version, MAX_VERSION_LENGTH)
                         service.extrainfo = probe.extrainfo
                         service.fingerprint_source = "http"
                         service.evidence = {

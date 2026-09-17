@@ -244,36 +244,59 @@ def test_authorization_revoked_after_queueing_fails_scan_without_scanning(
 # --- Phase 3: FINGERPRINTING transition + evidence persistence + native HTTP enrichment ---
 
 
-def test_nmap_path_persists_evidence_fields(db: Session, use_test_session: None) -> None:
+def test_nmap_path_persists_evidence_fields(
+    db: Session, use_test_session: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """nmap's own `-sV` evidence (product/version/extrainfo/raw_evidence)
     must land on the persisted Service row with fingerprint_source="nmap-sv",
     and nmap's own service-name guess must win over the PORT_NAMES fallback
     when nmap supplies one (the Phase 3 precedence flip) - while a result
     with no service_name guess still falls back to PORT_NAMES as before.
+
+    Uses port 3389 (RDP) for the precedence-flip case rather than 443:
+    nmap's own static-table guess for 3389 is "ms-wbt-server"
+    (verified against `PORT_NAMES[3389] == "rdp"` in
+    app.modules.discovery.common_ports), a genuine mismatch with this
+    project's PORT_NAMES fallback. Port 443's PORT_NAMES entry is also
+    "https" - identical to nmap's own guess - so a test built around port
+    443 would still pass even if the precedence flip were accidentally
+    reversed back to "PORT_NAMES wins"; this makes the assertion meaningful.
+
+    Also asserts (Global Constraint 4: HTTP probing is native-adapter-only)
+    that `probe_services` is never called for an nmap-adapter scan - this
+    test's own port 443/3389 choices matter here too, since 443 is also in
+    WEB_PORTS, so a regression of the `scanner_name == "native"` guard
+    would otherwise go completely undetected by this suite.
     """
+    assert PORT_NAMES.get(3389) == "rdp"  # sanity-check the chosen mismatch is real
+
     scan = _make_scan(db, value="127.0.0.1", config={"scanner": "nmap"})
     fake_results = [
         PortScanResult(
-            port=443,
+            port=3389,
             protocol="tcp",
             state="open",
-            service_name="https",
-            product="nginx",
+            service_name="ms-wbt-server",
+            product="Microsoft Terminal Services",
             version="1.24.0",
             extrainfo="Ubuntu",
             method="probed",
             cpe=("cpe:/a:nginx:nginx:1.24.0",),
-            raw_evidence={"name": "https", "product": "nginx", "version": "1.24.0"},
+            raw_evidence={"name": "ms-wbt-server", "product": "nginx", "version": "1.24.0"},
         ),
         # No service_name guess from nmap for this one -> falls back to
         # PORT_NAMES, exactly like the pre-Phase-3 behavior.
         PortScanResult(port=22, protocol="tcp", state="open"),
     ]
 
-    with patch.object(NmapPortScanner, "scan", return_value=fake_results) as mock_scan:
+    with (
+        patch.object(NmapPortScanner, "scan", return_value=fake_results) as mock_scan,
+        patch.object(tasks_module, "probe_services") as mock_probe,
+    ):
         tasks_module.run_scan_task(str(scan.id))
 
     mock_scan.assert_called_once()
+    mock_probe.assert_not_called()
 
     db.refresh(scan)
     assert scan.status == ScanStatus.COMPLETED
@@ -284,13 +307,20 @@ def test_nmap_path_persists_evidence_fields(db: Session, use_test_session: None)
         s.port: s for s in db.execute(select(Service).where(Service.asset_id == asset.id)).scalars()
     }
 
-    https_service = services[443]
-    assert https_service.service_name == "https"
-    assert https_service.product == "nginx"
-    assert https_service.version == "1.24.0"
-    assert https_service.extrainfo == "Ubuntu"
-    assert https_service.fingerprint_source == "nmap-sv"
-    assert https_service.evidence == {"name": "https", "product": "nginx", "version": "1.24.0"}
+    rdp_service = services[3389]
+    # This is the precedence-flip assertion: nmap's own guess
+    # ("ms-wbt-server") must win over PORT_NAMES[3389] ("rdp").
+    assert rdp_service.service_name == "ms-wbt-server"
+    assert rdp_service.service_name != PORT_NAMES.get(3389)
+    assert rdp_service.product == "Microsoft Terminal Services"
+    assert rdp_service.version == "1.24.0"
+    assert rdp_service.extrainfo == "Ubuntu"
+    assert rdp_service.fingerprint_source == "nmap-sv"
+    assert rdp_service.evidence == {
+        "name": "ms-wbt-server",
+        "product": "nginx",
+        "version": "1.24.0",
+    }
 
     ssh_service = services[22]
     assert ssh_service.service_name == PORT_NAMES.get(22)
@@ -357,6 +387,109 @@ def test_native_http_enrichment_updates_only_matching_web_port_service(
     assert services[22].product is None
     assert services[3306].fingerprint_source is None
     assert services[3306].product is None
+
+
+def test_native_http_enrichment_clamps_oversized_server_header_fields(
+    db: Session, use_test_session: None
+) -> None:
+    """Final-review finding #2: an over-length `Server` header (remote,
+    attacker-influenced input) must not raise a Postgres
+    StringDataRightTruncation error, and must not silently discard the
+    entire HTTP enrichment pass for every port (the fingerprinting
+    try/except rolls back and swallows ANY exception by design). The
+    `tasks._clamp` helper truncates `product`/`version` at the write site
+    to comfortably fit `Service.product` (String(255)) and
+    `Service.version` (String(100)). Crucially, the FULL, unclamped header
+    string must still be preserved verbatim in `evidence` - only the
+    structured convenience columns are clamped, per the "raw evidence
+    preserved verbatim" constraint.
+    """
+    scan = _make_scan(db, value="127.0.0.1")
+    fake_results = [PortScanResult(port=80, protocol="tcp", state="open")]
+
+    oversized_product = "X" * 1000  # far past Service.product's String(255)
+    oversized_version = "9" * 500  # far past Service.version's String(100)
+    server_header = f"{oversized_product}/{oversized_version}"
+    probe_result = HttpProbeResult(
+        port=80,
+        scheme="http",
+        status_code=200,
+        server_header=server_header,
+        product=oversized_product,
+        version=oversized_version,
+        extrainfo=None,
+        title=None,
+        headers={"server": server_header},
+    )
+
+    with (
+        patch.object(NativePortScanner, "scan", return_value=fake_results),
+        patch.object(tasks_module, "probe_services", return_value={80: probe_result}),
+    ):
+        tasks_module.run_scan_task(str(scan.id))
+
+    db.refresh(scan)
+    # The core contract: an oversized value must not fail the scan nor
+    # silently discard the whole enrichment pass - it still completes with
+    # fingerprint_source="http" for the affected port.
+    assert scan.status == ScanStatus.COMPLETED
+    assert scan.error_message is None
+
+    asset = db.execute(select(Asset).where(Asset.scan_id == scan.id)).scalar_one()
+    service = db.execute(select(Service).where(Service.asset_id == asset.id)).scalar_one()
+
+    assert service.fingerprint_source == "http"
+    assert service.product == oversized_product[: tasks_module.MAX_PRODUCT_LENGTH]
+    assert len(service.product) == tasks_module.MAX_PRODUCT_LENGTH
+    assert service.version == oversized_version[: tasks_module.MAX_VERSION_LENGTH]
+    assert len(service.version) == tasks_module.MAX_VERSION_LENGTH
+    # The FULL, unclamped header is preserved verbatim in evidence (JSONB,
+    # no length limit) - only product/version above were clamped.
+    assert service.evidence is not None
+    assert service.evidence["server"] == server_header
+    assert len(service.evidence["server"]) == len(server_header)
+
+
+def test_nmap_path_clamps_oversized_service_fields(db: Session, use_test_session: None) -> None:
+    """Final-review finding #2, nmap path: an over-length nmap
+    service_name/product/version (nmap's own internal buffers make this
+    unlikely in practice, but no explicit guard existed before this fix)
+    must be clamped at the write site rather than raising a Postgres
+    StringDataRightTruncation error on commit - which would otherwise fail
+    the entire scan to FAILED instead of just clamping the offending
+    fields.
+    """
+    scan = _make_scan(db, value="127.0.0.1", config={"scanner": "nmap"})
+    oversized_name = "n" * 200  # far past service_name's String(50)
+    oversized_product = "p" * 400  # far past product's String(255)
+    oversized_version = "v" * 300  # far past version's String(100)
+    fake_results = [
+        PortScanResult(
+            port=8080,
+            protocol="tcp",
+            state="open",
+            service_name=oversized_name,
+            product=oversized_product,
+            version=oversized_version,
+        ),
+    ]
+
+    with patch.object(NmapPortScanner, "scan", return_value=fake_results):
+        tasks_module.run_scan_task(str(scan.id))
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.COMPLETED
+    assert scan.error_message is None
+
+    asset = db.execute(select(Asset).where(Asset.scan_id == scan.id)).scalar_one()
+    service = db.execute(select(Service).where(Service.asset_id == asset.id)).scalar_one()
+
+    assert service.service_name == oversized_name[: tasks_module.MAX_SERVICE_NAME_LENGTH]
+    assert len(service.service_name) == tasks_module.MAX_SERVICE_NAME_LENGTH
+    assert service.product == oversized_product[: tasks_module.MAX_PRODUCT_LENGTH]
+    assert len(service.product) == tasks_module.MAX_PRODUCT_LENGTH
+    assert service.version == oversized_version[: tasks_module.MAX_VERSION_LENGTH]
+    assert len(service.version) == tasks_module.MAX_VERSION_LENGTH
 
 
 def test_native_http_enrichment_failure_does_not_fail_scan(
