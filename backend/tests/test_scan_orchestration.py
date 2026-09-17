@@ -263,10 +263,13 @@ def test_nmap_path_persists_evidence_fields(
     reversed back to "PORT_NAMES wins"; this makes the assertion meaningful.
 
     Also asserts (Global Constraint 4: HTTP probing is native-adapter-only)
-    that `probe_services` is never called for an nmap-adapter scan - this
-    test's own port 443/3389 choices matter here too, since 443 is also in
-    WEB_PORTS, so a regression of the `scanner_name == "native"` guard
-    would otherwise go completely undetected by this suite.
+    that `probe_services` is never called for an nmap-adapter scan. This
+    result set deliberately includes port 80 - which IS in WEB_PORTS -
+    specifically so `mock_probe.assert_not_called()` below is a genuine
+    check of the `scanner_name == "native"` guard: without a WEB_PORTS
+    port present, the guard could regress (e.g. lose the `scanner_name ==
+    "native"` check entirely) and this assertion would still trivially
+    pass, since there'd be no web port for a broken guard to react to.
     """
     assert PORT_NAMES.get(3389) == "rdp"  # sanity-check the chosen mismatch is real
 
@@ -287,6 +290,9 @@ def test_nmap_path_persists_evidence_fields(
         # No service_name guess from nmap for this one -> falls back to
         # PORT_NAMES, exactly like the pre-Phase-3 behavior.
         PortScanResult(port=22, protocol="tcp", state="open"),
+        # In WEB_PORTS - see the docstring above for why this port's
+        # presence is what makes assert_not_called() below meaningful.
+        PortScanResult(port=80, protocol="tcp", state="open", service_name="http"),
     ]
 
     with (

@@ -62,19 +62,33 @@ class _OversizedHandler(BaseHTTPRequestHandler):
 
 class _GzipBombHandler(BaseHTTPRequestHandler):
     """Serves a gzip-compressed body whose DECOMPRESSED size is ~100x
-    MAX_RESPONSE_BYTES, with a `<title>` placed only past that decompressed
-    boundary - locks in the decompression-amplification fix (`aiter_raw()`
-    over `aiter_bytes()`): a hostile server that ignores the prober's
-    `Accept-Encoding: identity` request and compresses anyway must not be
-    able to smuggle a body many times the cap past it by exploiting
-    transparent decompression. A regression from `aiter_raw()` back to
-    `aiter_bytes()` would decode the *decompressed* text, find this title,
-    and fail this test's `title is None` assertion.
+    MAX_RESPONSE_BYTES, with a `<title>` placed at the very FRONT of the
+    decompressed stream (well within the first MAX_RESPONSE_BYTES of the
+    decompressed text, followed by ~100x-the-cap of padding) - this is
+    deliberate, not incidental: it's what makes the test discriminate
+    `aiter_raw()` from `aiter_bytes()`.
+
+    The compressed body itself is small (under the cap), so a cap check
+    applied to *raw* bytes (aiter_raw(), the correct behavior) never
+    trips - the loop completes normally and the prober decodes the raw
+    gzip bytes as text, which is garbage, so `title` comes back None. A
+    regression to `aiter_bytes()` (transparent decompression) would grow
+    `body` past the cap on largely the first yielded chunk and break out
+    of the loop - but since the title sits in the first MAX_RESPONSE_BYTES
+    of the *decompressed* stream, it would still be present in that
+    truncated `body[:MAX_RESPONSE_BYTES]` slice and get matched. Putting
+    the title past the decompressed boundary instead (as an earlier draft
+    of this test did) would make it invisible to BOTH implementations
+    equally, since the cap-slice truncates before the title either way -
+    silently defeating the whole point of this test. Front-loading the
+    title is what makes `title is None` a real regression lock rather
+    than a vacuous assertion.
     """
 
     def do_GET(self) -> None:
+        title = b"<title>Hidden Beyond Decompression Cap</title>"
         padding = b"A" * (MAX_RESPONSE_BYTES * 100)
-        decompressed = padding + b"<title>Hidden Beyond Decompression Cap</title>"
+        decompressed = title + padding
         body = gzip.compress(decompressed)
         self.send_response_only(200)
         self.send_header("Server", "GzipBombServer/1.0")
