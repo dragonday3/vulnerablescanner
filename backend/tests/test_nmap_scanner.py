@@ -33,8 +33,19 @@ def test_detects_open_and_closed_ports() -> None:
         if closed_port == open_port:
             closed_port += 1
 
+        captured_cmd: list[str] = []
+        real_run = subprocess.run
+
+        def _spying_run(cmd, *args, **kwargs):  # type: ignore[no-untyped-def]
+            captured_cmd.extend(cmd)
+            return real_run(cmd, *args, **kwargs)
+
         scanner = NmapPortScanner()
-        results = scanner.scan("127.0.0.1", [open_port, closed_port], timeout_seconds=30.0)
+        with patch("subprocess.run", side_effect=_spying_run):
+            results = scanner.scan("127.0.0.1", [open_port, closed_port], timeout_seconds=30.0)
+
+        # Phase 3: -sV must actually be part of the built command.
+        assert "-sV" in captured_cmd
 
         open_ports = {result.port for result in results}
         assert open_port in open_ports
@@ -42,6 +53,18 @@ def test_detects_open_and_closed_ports() -> None:
         for result in results:
             assert result.protocol == "tcp"
             assert result.state == "open"
+            if result.port == open_port:
+                # A bare test listener (accepts connections, speaks nothing
+                # recognizable) is exactly the case where nmap's -sV probe
+                # can't identify anything useful. That must be a normal,
+                # non-crashing outcome: parsing must not raise, and an
+                # unidentified service must leave the evidence fields at
+                # their PortScanResult defaults rather than fabricating data.
+                assert isinstance(result.cpe, tuple)
+                if result.service_name is None:
+                    assert result.product is None
+                    assert result.version is None
+                    assert result.raw_evidence is None
     finally:
         listener.close()
 
@@ -135,6 +158,76 @@ def test_raises_on_multi_host_result_instead_of_collapsing_into_one(
     with patch("subprocess.run", return_value=fake_result):
         with pytest.raises(NmapScanError, match="scanned 3 hosts"):
             scanner.scan("172.18.0.2-4", [22, 80, 443], timeout_seconds=30.0)
+
+
+_SERVICE_EVIDENCE_XML = """<?xml version="1.0"?>
+<nmaprun>
+  <host>
+    <address addr="172.18.0.5" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="80">
+        <state state="open"/>
+        <service name="http" product="nginx" version="1.24.0"
+                 extrainfo="Ubuntu" method="probed" conf="10">
+          <cpe>cpe:/a:nginx:nginx:1.24.0</cpe>
+          <cpe>cpe:/o:linux:linux_kernel</cpe>
+        </service>
+      </port>
+      <port protocol="tcp" portid="22">
+        <state state="open"/>
+      </port>
+    </ports>
+  </host>
+  <runstats><hosts up="1" down="0" total="1"/></runstats>
+</nmaprun>
+"""
+
+
+def test_parses_service_and_cpe_evidence_from_sv_output() -> None:
+    """Deterministic unit test (doesn't depend on real nmap -sV probe
+    behavior): a canned XML fixture with a full <service> element plus two
+    <cpe> children must map exactly onto the new PortScanResult fields, and
+    a port with no <service> child (port 22 here) must leave those fields at
+    their defaults.
+    """
+    fake_result = subprocess.CompletedProcess(
+        args=["nmap"], returncode=0, stdout=_SERVICE_EVIDENCE_XML, stderr=""
+    )
+    scanner = NmapPortScanner()
+
+    with patch("subprocess.run", return_value=fake_result):
+        results = scanner.scan("172.18.0.5", [22, 80], timeout_seconds=30.0)
+
+    by_port = {result.port: result for result in results}
+    assert set(by_port) == {22, 80}
+
+    http = by_port[80]
+    assert http.protocol == "tcp"
+    assert http.state == "open"
+    assert http.service_name == "http"
+    assert http.product == "nginx"
+    assert http.version == "1.24.0"
+    assert http.extrainfo == "Ubuntu"
+    assert http.method == "probed"
+    assert http.cpe == ("cpe:/a:nginx:nginx:1.24.0", "cpe:/o:linux:linux_kernel")
+    assert http.raw_evidence == {
+        "name": "http",
+        "product": "nginx",
+        "version": "1.24.0",
+        "extrainfo": "Ubuntu",
+        "method": "probed",
+        "conf": "10",
+        "cpe": ["cpe:/a:nginx:nginx:1.24.0", "cpe:/o:linux:linux_kernel"],
+    }
+
+    ssh = by_port[22]
+    assert ssh.service_name is None
+    assert ssh.product is None
+    assert ssh.version is None
+    assert ssh.extrainfo is None
+    assert ssh.method is None
+    assert ssh.cpe == ()
+    assert ssh.raw_evidence is None
 
 
 def test_import_has_no_side_effects() -> None:

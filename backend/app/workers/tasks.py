@@ -21,8 +21,18 @@ logger = logging.getLogger(__name__)
 # scan profile fast/low-noise, while the nmap adapter needs a much larger
 # *overall* subprocess timeout since it scans up to 1000 ports in one
 # invocation ("a sane overall timeout, e.g. 120s" per the plan).
+#
+# Re-measured 2026-09-17 (Phase 3, PLAN_3.md #2) after adding `-sV` to the
+# nmap invocation, since service/version probing is meaningfully slower than
+# a bare `-sT` connect scan. Real top-1000-port `-sV` scans from inside the
+# `backend` container against in-network Docker Compose targets observed:
+# a single real service (postgres:5432 ~6.5s, backend:8000/uvicorn ~11.4s),
+# and a synthetic 11-open-port host (10 bare listeners + the real uvicorn
+# service on 8000) at ~11.5s total - worst observed wall-clock was ~11.5s.
+# 2-3x headroom on that measurement is under 35s, well below the fixed
+# floor the plan calls for, so the floor wins: 180.0s (up from 120.0s).
 NATIVE_SCAN_TIMEOUT_SECONDS = 1.5
-NMAP_SCAN_TIMEOUT_SECONDS = 120.0
+NMAP_SCAN_TIMEOUT_SECONDS = 180.0
 
 # Error-message column truncation guard (Task 6 brief step 8): a huge
 # traceback-derived string must never blow out the `error_message` Text
