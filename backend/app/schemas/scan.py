@@ -24,6 +24,7 @@ class ScanRead(BaseModel):
     updated_at: datetime
     started_at: datetime | None
     completed_at: datetime | None
+    error_message: str | None
 
 
 class ScanStatusRead(BaseModel):
@@ -32,3 +33,4 @@ class ScanStatusRead(BaseModel):
     id: uuid.UUID
     status: ScanStatus
     updated_at: datetime
+    error_message: str | None

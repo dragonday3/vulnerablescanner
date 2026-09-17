@@ -20,8 +20,24 @@ cp .env.example .env
 docker compose up --build
 ```
 
-This starts four services: `postgres`, `redis`, `backend` (FastAPI, hot
-reload), and `frontend` (Next.js dev server, hot reload).
+This starts five services: `postgres`, `redis`, `backend` (FastAPI, hot
+reload), `worker` (Celery worker — actually executes scans), and `frontend`
+(Next.js dev server, hot reload).
+
+Scans are not run inline by the API process: `POST /scans` enqueues a task
+onto `redis` (used here as the Celery broker) and the `worker` service picks
+it up and runs the actual port scan (native asyncio-based by default, or
+`nmap` if a scan's `config.scanner` is set to `"nmap"`). `nmap` is installed
+inside the backend/worker Docker image itself — there's nothing to install
+on the host.
+
+The `worker` container does **not** hot-reload on code changes the way
+`backend` and `frontend` do. After editing worker/task code, pick the
+change up with:
+
+```bash
+docker compose restart worker
+```
 
 ### Apply the database migration
 

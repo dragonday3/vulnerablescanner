@@ -16,6 +16,29 @@ services:
       postgres:
         condition: service_healthy
 
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: celery -A app.workers.celery_app worker --loglevel=info
+    # Same bind mount as backend, for dev convenience. Unlike uvicorn
+    # --reload on the backend service, Celery does not reliably autoreload
+    # on code changes, so `docker compose restart worker` is the expected
+    # workflow during development (mirroring the Windows hot-reload note
+    # in the README).
+    volumes:
+      - ./backend:/app
+    environment:
+      - DATABASE_URL=postgresql+psycopg://vulnsight:vulnsight@postgres:5432/vulnsight
+      - REDIS_URL=redis://redis:6379/0
+      - ENVIRONMENT=development
+      - LOG_LEVEL=INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
   frontend:
     build:
       context: ./frontend

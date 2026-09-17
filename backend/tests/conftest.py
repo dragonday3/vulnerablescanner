@@ -29,6 +29,7 @@ constraint/SQL issues.
 
 import os
 from collections.abc import Generator
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -61,6 +62,8 @@ from app.db.session import get_db  # noqa: E402
 # app.db.base has already run and registered every model on Base, so
 # relationship() string references like Mapped["Target"] resolve correctly.
 from app.main import app  # noqa: E402
+from app.workers.celery_app import celery_app  # noqa: E402
+from app.workers.tasks import run_scan_task  # noqa: E402
 
 test_engine: Engine = create_engine(TEST_DATABASE_URL)
 
@@ -115,3 +118,44 @@ def client(db: Session) -> Generator[TestClient, None, None]:
             yield test_client
     finally:
         app.dependency_overrides.pop(get_db, None)
+
+
+@pytest.fixture(autouse=True)
+def mock_run_scan_task_apply_async() -> Generator[MagicMock, None, None]:
+    """Global safety net, not just a test_scans.py concern: ANY test that
+    goes through `POST /scans` (e.g. test_projects.py's cascade-delete test,
+    not only test_scans.py itself) now indirectly calls
+    `run_scan_task.apply_async(...)`, which — unmocked — really publishes to
+    the Redis broker configured by REDIS_URL and gets picked up by whatever
+    real Celery worker is listening (a live `docker compose` worker in dev,
+    for instance). That's a real cross-process side effect a unit test suite
+    must not have: it's slow, non-hermetic, and leaves the worker logging
+    "scan not found" for a scan row that a moment later gets rolled back by
+    this file's own savepoint-based test isolation. Autouse + defined here
+    (not just in test_scans.py) ensures every test in the whole suite is
+    covered, not just the ones that happen to know to ask for it.
+
+    `create_scan` now pre-generates the Celery task id itself (a `uuid4()`)
+    and commits it to the DB before ever calling `apply_async` (see the
+    lost-update-race fix in `scan_service.create_scan`), so this mock no
+    longer needs to fabricate a fake id via a fake `AsyncResult` - it only
+    needs to swallow the call so it never reaches the real broker.
+    """
+    with patch.object(run_scan_task, "apply_async") as mock_apply_async:
+        yield mock_apply_async
+
+
+@pytest.fixture(autouse=True)
+def mock_celery_control_revoke() -> Generator[MagicMock, None, None]:
+    """Same rationale as `mock_run_scan_task_delay` above, for the other
+    half of the enqueue/revoke pair Task 7 wires up: every scan created via
+    the mocked `.delay()` now carries a non-null `celery_task_id`
+    (`FAKE_CELERY_TASK_ID`), so ANY test that cancels a scan - not just the
+    ones specifically testing revoke behavior - now exercises
+    `cancel_scan`'s `celery_app.control.revoke(...)` call. Unmocked, that's
+    a second real broker round trip (a real pidbox broadcast the live
+    worker picks up and logs) hiding in tests that never intended to touch
+    Celery at all, e.g. the plain cancel-transitions-to-CANCELLED test.
+    """
+    with patch.object(celery_app.control, "revoke") as mock_revoke:
+        yield mock_revoke
