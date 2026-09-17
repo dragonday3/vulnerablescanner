@@ -4,7 +4,9 @@ from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
+from app.models.asset import Asset
 from app.models.scan import Scan
+from app.schemas.asset import AssetRead
 from app.schemas.scan import ScanCreate, ScanRead, ScanStatusRead
 from app.services import scan_service
 
@@ -34,3 +36,8 @@ def get_scan_status(scan_id: uuid.UUID, db: Session = Depends(get_db)) -> Scan:
 @router.post("/{scan_id}/cancel", response_model=ScanRead)
 def cancel_scan(scan_id: uuid.UUID, db: Session = Depends(get_db)) -> Scan:
     return scan_service.cancel_scan(db, scan_id)
+
+
+@router.get("/{scan_id}/assets", response_model=list[AssetRead])
+def get_scan_assets(scan_id: uuid.UUID, db: Session = Depends(get_db)) -> list[Asset]:
+    return scan_service.get_scan_assets(db, scan_id)

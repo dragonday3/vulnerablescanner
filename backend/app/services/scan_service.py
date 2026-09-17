@@ -1,9 +1,10 @@
 import logging
 import uuid
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.core.exceptions import NotFoundError, ScanStateError, ValidationConflictError
+from app.models.asset import Asset
 from app.models.project import Project
 from app.models.scan import Scan, ScanStatus
 from app.models.target import Target
@@ -80,6 +81,17 @@ def get_scan(db: Session, scan_id: uuid.UUID) -> Scan:
     if scan is None:
         raise NotFoundError(f"Scan {scan_id} not found")
     return scan
+
+
+def get_scan_assets(db: Session, scan_id: uuid.UUID) -> list[Asset]:
+    get_scan(db, scan_id)  # raises NotFoundError if the scan itself doesn't exist
+    return (
+        db.query(Asset)
+        .options(selectinload(Asset.services))
+        .filter(Asset.scan_id == scan_id)
+        .order_by(Asset.created_at)
+        .all()
+    )
 
 
 def cancel_scan(db: Session, scan_id: uuid.UUID) -> Scan:
