@@ -117,44 +117,61 @@ async def _probe_port(
     scheme = "https" if port in _TLS_HEURISTIC_PORTS else "http"
     url = f"{scheme}://{host}:{port}/"
 
-    status_code = 0
-    headers: dict[str, str] = {}
-    server_header: str | None = None
-    body = b""
-
     async with semaphore:
         try:
-            async with client.stream("GET", url) as response:
+            body = b""
+            # Ask for an uncompressed response (most servers honor this and
+            # skip compression entirely, so title extraction works on the
+            # common case), but don't *rely* on the target being honest:
+            # `aiter_raw()` below reads wire bytes with no transparent
+            # decompression, so MAX_RESPONSE_BYTES is a real bound on bytes
+            # pulled into memory even against a hostile server that sends
+            # `Content-Encoding: gzip` anyway (a small compressed payload
+            # decompressing to a huge body - "decompression amplification" -
+            # would otherwise be able to blow well past the cap between one
+            # check and the next, since `aiter_bytes()` yields already
+            # -decompressed chunks).
+            async with client.stream(
+                "GET", url, headers={"Accept-Encoding": "identity"}
+            ) as response:
                 status_code = response.status_code
-                headers = dict(response.headers)
+                headers: dict[str, str] = dict(response.headers)
                 server_header = response.headers.get("server")
-                async for chunk in response.aiter_bytes():
+                async for chunk in response.aiter_raw():
                     body += chunk
                     if len(body) >= MAX_RESPONSE_BYTES:
                         break
+
+            # A response that ignored Accept-Encoding and compressed anyway
+            # decodes here to mostly-garbage text; that's an acceptable
+            # tradeoff (best-effort title extraction just won't find
+            # anything), not a bug - the cap above already did its job.
+            body_text = body[:MAX_RESPONSE_BYTES].decode("utf-8", errors="replace")
+            title = _extract_title(body_text)
+
+            product: str | None = None
+            version: str | None = None
+            extrainfo: str | None = None
+            if server_header:
+                product, version, extrainfo = _parse_server_header(server_header)
+
+            return HttpProbeResult(
+                port=port,
+                scheme=scheme,
+                status_code=status_code,
+                server_header=server_header,
+                product=product,
+                version=version,
+                extrainfo=extrainfo,
+                title=title,
+                headers=headers,
+            )
         except Exception:
+            # Covers the full per-port lifecycle - network I/O *and* the
+            # post-processing below it (decode/regex/dataclass construction)
+            # - so a future edit to that post-processing can't silently
+            # reintroduce a whole-batch failure from one bad target.
             return None
-
-    body_text = body[:MAX_RESPONSE_BYTES].decode("utf-8", errors="replace")
-    title = _extract_title(body_text)
-
-    product: str | None = None
-    version: str | None = None
-    extrainfo: str | None = None
-    if server_header:
-        product, version, extrainfo = _parse_server_header(server_header)
-
-    return HttpProbeResult(
-        port=port,
-        scheme=scheme,
-        status_code=status_code,
-        server_header=server_header,
-        product=product,
-        version=version,
-        extrainfo=extrainfo,
-        title=title,
-        headers=headers,
-    )
 
 
 async def _probe_services_async(
@@ -165,10 +182,17 @@ async def _probe_services_async(
 ) -> dict[int, HttpProbeResult]:
     semaphore = asyncio.Semaphore(max_concurrency)
     async with httpx.AsyncClient(follow_redirects=False, timeout=timeout_seconds) as client:
-        results = await asyncio.gather(
-            *(_probe_port(client, host, port, semaphore) for port in ports)
+        # `return_exceptions=True` is defense-in-depth, not the primary
+        # guard: `_probe_port` already catches everything itself and
+        # returns `None` on failure. This just ensures that even if a
+        # future edit to `_probe_port` ever let an exception slip through,
+        # one bad target still couldn't blow up every other port's result
+        # via `asyncio.gather`'s normal fail-fast behavior.
+        raw_results = await asyncio.gather(
+            *(_probe_port(client, host, port, semaphore) for port in ports),
+            return_exceptions=True,
         )
-    return {result.port: result for result in results if result is not None}
+    return {result.port: result for result in raw_results if isinstance(result, HttpProbeResult)}
 
 
 def probe_services(
