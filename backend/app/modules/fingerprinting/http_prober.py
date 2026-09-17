@@ -8,6 +8,15 @@ timeout distinct from the overall scan timeout, no redirect-following
 individual port is swallowed here and simply omits that port from the
 returned dict — callers (app.workers.tasks) never treat an empty/partial
 result as an error.
+
+The per-request timeout is enforced twice: `httpx.Timeout(timeout_seconds)`
+bounds each individual I/O operation (connect/read/write/pool), and
+`asyncio.wait_for` in `_probe_port` additionally bounds the *whole*
+request/response cycle for a port to `timeout_seconds * 3` - a true
+total-operation deadline. The per-operation bound alone is not sufficient:
+a target that trickles bytes just under each per-operation timeout would
+otherwise never trip any single timeout and could stall a probe (and thus
+the whole enrichment pass) indefinitely.
 """
 
 import asyncio
@@ -101,11 +110,71 @@ def _extract_title(body_text: str) -> str | None:
     return collapsed[:200] or None
 
 
+async def _probe_port_body(
+    client: httpx.AsyncClient,
+    host: str,
+    port: int,
+) -> HttpProbeResult | None:
+    """The actual per-port probe work, factored out of `_probe_port` so it
+    can be wrapped in a total-operation deadline (`asyncio.wait_for`) by the
+    caller - see `_probe_port` for why that wrapping is necessary.
+    """
+    scheme = "https" if port in _TLS_HEURISTIC_PORTS else "http"
+    url = f"{scheme}://{host}:{port}/"
+
+    body = b""
+    # Ask for an uncompressed response (most servers honor this and
+    # skip compression entirely, so title extraction works on the
+    # common case), but don't *rely* on the target being honest:
+    # `aiter_raw()` below reads wire bytes with no transparent
+    # decompression, so MAX_RESPONSE_BYTES is a real bound on bytes
+    # pulled into memory even against a hostile server that sends
+    # `Content-Encoding: gzip` anyway (a small compressed payload
+    # decompressing to a huge body - "decompression amplification" -
+    # would otherwise be able to blow well past the cap between one
+    # check and the next, since `aiter_bytes()` yields already
+    # -decompressed chunks).
+    async with client.stream("GET", url, headers={"Accept-Encoding": "identity"}) as response:
+        status_code = response.status_code
+        headers: dict[str, str] = dict(response.headers)
+        server_header = response.headers.get("server")
+        async for chunk in response.aiter_raw():
+            body += chunk
+            if len(body) >= MAX_RESPONSE_BYTES:
+                break
+
+    # A response that ignored Accept-Encoding and compressed anyway
+    # decodes here to mostly-garbage text; that's an acceptable
+    # tradeoff (best-effort title extraction just won't find
+    # anything), not a bug - the cap above already did its job.
+    body_text = body[:MAX_RESPONSE_BYTES].decode("utf-8", errors="replace")
+    title = _extract_title(body_text)
+
+    product: str | None = None
+    version: str | None = None
+    extrainfo: str | None = None
+    if server_header:
+        product, version, extrainfo = _parse_server_header(server_header)
+
+    return HttpProbeResult(
+        port=port,
+        scheme=scheme,
+        status_code=status_code,
+        server_header=server_header,
+        product=product,
+        version=version,
+        extrainfo=extrainfo,
+        title=title,
+        headers=headers,
+    )
+
+
 async def _probe_port(
     client: httpx.AsyncClient,
     host: str,
     port: int,
     semaphore: asyncio.Semaphore,
+    timeout_seconds: float,
 ) -> HttpProbeResult | None:
     """Probe a single port with exactly one scheme attempt.
 
@@ -113,64 +182,35 @@ async def _probe_port(
     can't even be streamed) is caught here and turned into `None` - this
     coroutine never raises for a per-port failure, only genuine misuse
     upstream (e.g. a bad `client`/`host`) would do that.
-    """
-    scheme = "https" if port in _TLS_HEURISTIC_PORTS else "http"
-    url = f"{scheme}://{host}:{port}/"
 
+    `httpx.Timeout(timeout_seconds)` on the client (see
+    `_probe_services_async`) only bounds each individual I/O operation
+    (connect, one read, one write) - not the request as a whole. A target
+    that trickles one byte at a time, each arriving just under the
+    per-read timeout, never trips any single per-operation timeout and can
+    stall this coroutine indefinitely (worst case: hours), even though
+    every individual `await` inside `_probe_port_body` eventually
+    "succeeds". `asyncio.wait_for` below adds the missing total-operation
+    deadline. `timeout_seconds * 3` (connect + response headers + body
+    read, each allowed up to one full per-operation timeout in the worst
+    case) is a deliberately generous but still-bounded ceiling - generous
+    enough not to cut off a slow-but-legitimate target mid-handshake,
+    bounded enough to guarantee `probe_services` returns in a small,
+    predictable multiple of its `timeout_seconds` argument no matter how a
+    misbehaving target drips bytes.
+    """
     async with semaphore:
         try:
-            body = b""
-            # Ask for an uncompressed response (most servers honor this and
-            # skip compression entirely, so title extraction works on the
-            # common case), but don't *rely* on the target being honest:
-            # `aiter_raw()` below reads wire bytes with no transparent
-            # decompression, so MAX_RESPONSE_BYTES is a real bound on bytes
-            # pulled into memory even against a hostile server that sends
-            # `Content-Encoding: gzip` anyway (a small compressed payload
-            # decompressing to a huge body - "decompression amplification" -
-            # would otherwise be able to blow well past the cap between one
-            # check and the next, since `aiter_bytes()` yields already
-            # -decompressed chunks).
-            async with client.stream(
-                "GET", url, headers={"Accept-Encoding": "identity"}
-            ) as response:
-                status_code = response.status_code
-                headers: dict[str, str] = dict(response.headers)
-                server_header = response.headers.get("server")
-                async for chunk in response.aiter_raw():
-                    body += chunk
-                    if len(body) >= MAX_RESPONSE_BYTES:
-                        break
-
-            # A response that ignored Accept-Encoding and compressed anyway
-            # decodes here to mostly-garbage text; that's an acceptable
-            # tradeoff (best-effort title extraction just won't find
-            # anything), not a bug - the cap above already did its job.
-            body_text = body[:MAX_RESPONSE_BYTES].decode("utf-8", errors="replace")
-            title = _extract_title(body_text)
-
-            product: str | None = None
-            version: str | None = None
-            extrainfo: str | None = None
-            if server_header:
-                product, version, extrainfo = _parse_server_header(server_header)
-
-            return HttpProbeResult(
-                port=port,
-                scheme=scheme,
-                status_code=status_code,
-                server_header=server_header,
-                product=product,
-                version=version,
-                extrainfo=extrainfo,
-                title=title,
-                headers=headers,
+            return await asyncio.wait_for(
+                _probe_port_body(client, host, port), timeout=timeout_seconds * 3
             )
         except Exception:
             # Covers the full per-port lifecycle - network I/O *and* the
             # post-processing below it (decode/regex/dataclass construction)
-            # - so a future edit to that post-processing can't silently
-            # reintroduce a whole-batch failure from one bad target.
+            # - plus `asyncio.wait_for`'s own `TimeoutError` when the total
+            # deadline above is exceeded, so a future edit to that
+            # post-processing can't silently reintroduce a whole-batch
+            # failure from one bad target.
             return None
 
 
@@ -181,7 +221,21 @@ async def _probe_services_async(
     max_concurrency: int,
 ) -> dict[int, HttpProbeResult]:
     semaphore = asyncio.Semaphore(max_concurrency)
-    async with httpx.AsyncClient(follow_redirects=False, timeout=timeout_seconds) as client:
+    # verify=False is deliberate, not an oversight: this prober sends no
+    # credentials, follows no redirects (follow_redirects=False above), and
+    # treats the HTTP response purely as passive fingerprinting evidence -
+    # the same posture `nmap -sV`/`curl -k` take. It never authenticates to
+    # or trusts the target in any security-relevant way; it just reads a
+    # banner. The overwhelmingly common case for this scanner's targets is
+    # an internal/lab host with a self-signed or internal-CA certificate on
+    # 443/4443/8443 (`_TLS_HEURISTIC_PORTS`); with the default `verify=True`
+    # every such probe raises an SSL verification error, gets swallowed by
+    # `_probe_port`'s per-port exception handler, and silently omits port
+    # 443 - arguably the single most valuable port in the allowlist - from
+    # results against exactly the targets this module exists to probe.
+    async with httpx.AsyncClient(
+        follow_redirects=False, timeout=timeout_seconds, verify=False
+    ) as client:
         # `return_exceptions=True` is defense-in-depth, not the primary
         # guard: `_probe_port` already catches everything itself and
         # returns `None` on failure. This just ensures that even if a
@@ -189,7 +243,7 @@ async def _probe_services_async(
         # one bad target still couldn't blow up every other port's result
         # via `asyncio.gather`'s normal fail-fast behavior.
         raw_results = await asyncio.gather(
-            *(_probe_port(client, host, port, semaphore) for port in ports),
+            *(_probe_port(client, host, port, semaphore, timeout_seconds) for port in ports),
             return_exceptions=True,
         )
     return {result.port: result for result in raw_results if isinstance(result, HttpProbeResult)}
