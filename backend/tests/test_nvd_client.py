@@ -16,6 +16,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import httpx
+import redis
 
 from app.modules.vulnerability.nvd_client import (
     NVD_BASE_URL,
@@ -41,6 +42,18 @@ class _TimeoutRateLimiter:
 
     def acquire(self) -> None:
         raise RateLimiterTimeoutError("timed out waiting for a slot")
+
+
+class _RedisErrorRateLimiter:
+    """Stub rate limiter: `acquire()` raises a Redis-level error, as the
+    real `NvdRateLimiter.acquire()` -> `try_acquire()` would if the
+    underlying Redis round trip (EVALSHA/EVAL of the rate-limit script)
+    itself failed (connection drop, timeout, server restart) rather than
+    the rate limiter's own `max_wait_seconds` logic timing out.
+    """
+
+    def acquire(self) -> None:
+        raise redis.exceptions.ConnectionError("connection refused")
 
 
 # `redis_client` is never touched by `fetch_cves_for_cpe` whenever a
@@ -249,6 +262,17 @@ def test_fetch_cves_rate_limiter_timeout_returns_none(monkeypatch) -> None:
     monkeypatch.setattr(httpx, "get", MagicMock(side_effect=AssertionError("should not be called")))
 
     assert fetch_cves_for_cpe(CPE23, _FAKE_REDIS, rate_limiter=_TimeoutRateLimiter()) is None
+
+
+def test_fetch_cves_redis_error_during_rate_limit_acquire_returns_none(monkeypatch) -> None:
+    """A Redis-level failure (connection drop, timeout, etc.) while
+    acquiring the rate limit slot is distinct from the rate limiter's
+    own `RateLimiterTimeoutError` -- both must be swallowed the same
+    way, and `httpx.get` must never even be reached.
+    """
+    monkeypatch.setattr(httpx, "get", MagicMock(side_effect=AssertionError("should not be called")))
+
+    assert fetch_cves_for_cpe(CPE23, _FAKE_REDIS, rate_limiter=_RedisErrorRateLimiter()) is None
 
 
 def test_fetch_cves_no_rate_limiter_constructs_one_from_redis_client(monkeypatch) -> None:
