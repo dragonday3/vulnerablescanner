@@ -5,6 +5,8 @@
  * `fingerprint_source`/`evidence`).
  */
 
+import type { FindingRead } from "./finding";
+
 // The backend column is a plain nullable `String(20)`, but typing it as a
 // closed union here (rather than `string | null`) means adding a new
 // fingerprint source later is a type-checked reminder to update
@@ -24,4 +26,5 @@ export interface ServiceRead {
   fingerprint_source: FingerprintSource;
   evidence: Record<string, unknown> | null;
   created_at: string;
+  findings: FindingRead[];
 }
