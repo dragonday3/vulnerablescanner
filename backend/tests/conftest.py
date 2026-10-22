@@ -30,8 +30,10 @@ constraint/SQL issues.
 import os
 from collections.abc import Generator
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
+import redis
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL, Engine, make_url
@@ -53,6 +55,20 @@ TEST_DATABASE_URL = os.environ.setdefault(
     # render_as_string(hide_password=False): plain str(URL) masks the
     # password as "***", which would make the derived URL unusable.
     make_url(_DATABASE_URL).set(database="vulnsight_test").render_as_string(hide_password=False),
+)
+
+# Same env-var-with-default pattern as DATABASE_URL/TEST_DATABASE_URL above,
+# mirrored for Redis: a dedicated test database index (15) on the same
+# Redis server as dev, rather than a whole separate database name (Redis
+# doesn't have those — numbered logical databases are the equivalent of
+# the Postgres "vulnsight" / "vulnsight_test" split). This is safe to
+# `flushdb()` freely in tests specifically *because* it's a dedicated
+# index, never index 0, which is what the real Celery broker/backend and
+# the app's rate limiter actually use.
+_REDIS_URL = os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
+TEST_REDIS_URL = os.environ.setdefault(
+    "TEST_REDIS_URL",
+    urlunsplit(urlsplit(_REDIS_URL)._replace(path="/15")),
 )
 
 from app.db.base_class import Base  # noqa: E402
@@ -105,6 +121,30 @@ def db() -> Generator[Session, None, None]:
         session.close()
         trans.rollback()
         connection.close()
+
+
+@pytest.fixture()
+def redis_client() -> Generator["redis.Redis", None, None]:
+    """A real connection to the dedicated test Redis index (see
+    TEST_REDIS_URL above), flushed before and after each test for
+    isolation. Function-scoped (rather than a session-scoped connection
+    shared across tests) since the tests that need this - the rate
+    limiter's - share one global Redis key (`vulnsight:nvd:ratelimit`)
+    by design, so cross-test isolation has to come from flushing, not
+    merely from each test getting its own key.
+
+    Deliberately does NOT swallow connection errors: if TEST_REDIS_URL /
+    REDIS_URL is unreachable, `flushdb()` raises `redis.ConnectionError`
+    and the test fails loudly, rather than this fixture silently
+    skipping/yielding a non-functional client.
+    """
+    client = redis.Redis.from_url(TEST_REDIS_URL, decode_responses=True)
+    client.flushdb()
+    try:
+        yield client
+    finally:
+        client.flushdb()
+        client.close()
 
 
 @pytest.fixture()
