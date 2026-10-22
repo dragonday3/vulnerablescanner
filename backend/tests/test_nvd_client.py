@@ -337,8 +337,42 @@ def test_fetch_cves_queries_expected_nvd_url_and_params(monkeypatch) -> None:
 
     args, kwargs = captured_calls[-1]
     assert args[0] == NVD_BASE_URL
+    # `isVulnerable` must be present with an EMPTY value, not the string
+    # "true" -- NVD's real CVE API 2.0 404s on `isVulnerable=true`
+    # ("isVulnerable parameter cannot have a value.") and only accepts
+    # the bare/empty-valued flag form. This was missed entirely by a
+    # dict-equality check alone in an earlier version of this test
+    # (both sides agreed on the wrong value), so this assertion is kept
+    # deliberately explicit about the exact value, not just the key.
     assert kwargs["params"] == {
         "cpeName": CPE23,
-        "isVulnerable": "true",
+        "isVulnerable": "",
         "resultsPerPage": 200,
     }
+
+
+def test_fetch_cves_serialized_query_string_matches_nvd_api_requirements(monkeypatch) -> None:
+    """Regression test for the `isVulnerable=true` -> 404 bug: asserts
+    against the *actual serialized query string* httpx would send on
+    the wire (via `httpx.QueryParams`, the same encoder httpx.get uses
+    internally), not just the params dict passed in. A dict-level
+    assertion alone can't distinguish "this is definitely what hits the
+    wire" from "this is what we intended, which might still be wrong in
+    a way the dict comparison can't see" -- e.g. a future accidental
+    change to `True` (bool) instead of `""` (str) would serialize
+    differently (`isVulnerable=true` again) while still being a
+    plausible-looking dict value to eyeball.
+    """
+    captured_params: list[Any] = []
+
+    def _capture_get(*args: Any, **kwargs: Any) -> httpx.Response:
+        captured_params.append(kwargs["params"])
+        return httpx.Response(200, json={"vulnerabilities": []})
+
+    monkeypatch.setattr(httpx, "get", _capture_get)
+
+    fetch_cves_for_cpe(CPE23, _FAKE_REDIS, rate_limiter=_NoopRateLimiter())
+
+    query_string = str(httpx.QueryParams(captured_params[-1]))
+    assert "isVulnerable=&" in query_string or query_string.endswith("isVulnerable=")
+    assert "isVulnerable=true" not in query_string
