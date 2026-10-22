@@ -3,6 +3,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict
 
+from app.schemas.finding import FindingRead
+
 
 class ServiceRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -19,3 +21,4 @@ class ServiceRead(BaseModel):
     fingerprint_source: str | None
     evidence: dict | None
     created_at: datetime
+    findings: list[FindingRead] = []
