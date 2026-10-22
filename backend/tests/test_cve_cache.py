@@ -88,6 +88,50 @@ def test_is_stale_false_for_freshly_stored_row(db: Session) -> None:
     assert is_stale(entry) is False
 
 
+def test_is_stale_false_just_inside_ttl_boundary(db: Session) -> None:
+    """`is_stale` uses a strict `>` comparison against `CVE_CACHE_TTL_DAYS`,
+    so an entry that is just *under* the TTL is still fresh. This probes
+    the actual boundary (a few seconds' margin, not a whole extra day as
+    in `test_is_stale_true_past_ttl` above) so it would catch a `>` ->
+    `>=` regression or an off-by-one in the day count. The few-seconds
+    margin (rather than exactly zero) avoids flaking on the real wall-
+    clock time elapsed between setting `fetched_at` here and `is_stale`
+    calling `datetime.now(UTC)` a moment later.
+    """
+    entry = CveCache(cpe=CPE23, total_results=0, cves=[])
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+
+    entry.fetched_at = (
+        datetime.now(UTC) - timedelta(days=CVE_CACHE_TTL_DAYS) + timedelta(seconds=10)
+    )
+    db.commit()
+    db.refresh(entry)
+
+    assert is_stale(entry) is False
+
+
+def test_is_stale_true_just_outside_ttl_boundary(db: Session) -> None:
+    """Complementary case to the just-inside test above: an entry just
+    *over* the TTL (by a few seconds, not a whole extra day) is stale --
+    together these two lock in the strict-`>` semantics on both sides of
+    the exact boundary.
+    """
+    entry = CveCache(cpe=CPE23, total_results=0, cves=[])
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+
+    entry.fetched_at = (
+        datetime.now(UTC) - timedelta(days=CVE_CACHE_TTL_DAYS) - timedelta(seconds=10)
+    )
+    db.commit()
+    db.refresh(entry)
+
+    assert is_stale(entry) is True
+
+
 def test_store_twice_upserts_instead_of_duplicating(db: Session) -> None:
     first_cves = _make_cves()
     store(db, CPE23, first_cves, total_results=2)
