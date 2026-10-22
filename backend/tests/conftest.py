@@ -123,28 +123,43 @@ def db() -> Generator[Session, None, None]:
         connection.close()
 
 
-@pytest.fixture()
-def redis_client() -> Generator["redis.Redis", None, None]:
-    """A real connection to the dedicated test Redis index (see
-    TEST_REDIS_URL above), flushed before and after each test for
-    isolation. Function-scoped (rather than a session-scoped connection
-    shared across tests) since the tests that need this - the rate
-    limiter's - share one global Redis key (`vulnsight:nvd:ratelimit`)
-    by design, so cross-test isolation has to come from flushing, not
-    merely from each test getting its own key.
+# Mirrors `test_engine` above: the Redis connection is created once, at
+# import time, rather than per-test - `redis.Redis` is itself backed by
+# an internal connection pool, so this single client is the Redis
+# equivalent of the single `test_engine` Postgres connection pool.
+_test_redis_client: redis.Redis = redis.Redis.from_url(TEST_REDIS_URL, decode_responses=True)
 
-    Deliberately does NOT swallow connection errors: if TEST_REDIS_URL /
-    REDIS_URL is unreachable, `flushdb()` raises `redis.ConnectionError`
-    and the test fails loudly, rather than this fixture silently
-    skipping/yielding a non-functional client.
+
+@pytest.fixture(scope="session", autouse=True)
+def _test_redis() -> Generator[None, None, None]:
+    """Session-scoped counterpart to `_test_database` above. Confirms
+    `_test_redis_client` can actually reach the dedicated test Redis
+    index once, up front - so an unreachable TEST_REDIS_URL/REDIS_URL
+    fails loudly at session setup via `redis.ConnectionError`, not
+    silently - and closes it once the whole session is done. Per-test
+    isolation is handled separately by the function-scoped
+    `redis_client` fixture below, which reuses this same connection
+    rather than opening a new one per test.
     """
-    client = redis.Redis.from_url(TEST_REDIS_URL, decode_responses=True)
-    client.flushdb()
+    _test_redis_client.ping()
+    yield
+    _test_redis_client.close()
+
+
+@pytest.fixture()
+def redis_client() -> Generator[redis.Redis, None, None]:
+    """Per-test isolation layered on top of the one shared
+    session-scoped connection (`_test_redis_client`): `flushdb()`
+    before and after each test, rather than constructing/closing a
+    fresh client per test - mirroring how the Postgres `db` fixture
+    checks a connection out of the already-created `test_engine` pool
+    per test instead of recreating the engine itself each time.
+    """
+    _test_redis_client.flushdb()
     try:
-        yield client
+        yield _test_redis_client
     finally:
-        client.flushdb()
-        client.close()
+        _test_redis_client.flushdb()
 
 
 @pytest.fixture()
