@@ -7,6 +7,7 @@ Redis/HTTP touched at all.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
 
 from sqlalchemy.orm import Session
 
@@ -89,14 +90,19 @@ def test_is_stale_false_for_freshly_stored_row(db: Session) -> None:
 
 
 def test_is_stale_false_just_inside_ttl_boundary(db: Session) -> None:
-    """`is_stale` uses a strict `>` comparison against `CVE_CACHE_TTL_DAYS`,
-    so an entry that is just *under* the TTL is still fresh. This probes
-    the actual boundary (a few seconds' margin, not a whole extra day as
-    in `test_is_stale_true_past_ttl` above) so it would catch a `>` ->
-    `>=` regression or an off-by-one in the day count. The few-seconds
-    margin (rather than exactly zero) avoids flaking on the real wall-
-    clock time elapsed between setting `fetched_at` here and `is_stale`
-    calling `datetime.now(UTC)` a moment later.
+    """A row that is `CVE_CACHE_TTL_DAYS` days old minus a 10-second
+    margin is still fresh. This (and its complementary case below) uses
+    real wall-clock time with a 10-second margin on each side of the
+    nominal boundary, which is enough to reliably catch a day-count /
+    off-by-one regression in `CVE_CACHE_TTL_DAYS` -- but a margin-based
+    test like this one is structurally unable to distinguish `>` from
+    `>=` in `is_stale`'s own comparison: both operators agree at every
+    point except the single exact instant `elapsed == CVE_CACHE_TTL_DAYS`,
+    and any nonzero margin necessarily lands outside that single point.
+    See `test_is_stale_false_at_exact_ttl_boundary` /
+    `test_is_stale_true_one_microsecond_past_exact_ttl_boundary` below
+    for a deterministic test of that exact-equality operator choice,
+    using a mocked "now" rather than the real wall clock.
     """
     entry = CveCache(cpe=CPE23, total_results=0, cves=[])
     db.add(entry)
@@ -113,10 +119,12 @@ def test_is_stale_false_just_inside_ttl_boundary(db: Session) -> None:
 
 
 def test_is_stale_true_just_outside_ttl_boundary(db: Session) -> None:
-    """Complementary case to the just-inside test above: an entry just
-    *over* the TTL (by a few seconds, not a whole extra day) is stale --
-    together these two lock in the strict-`>` semantics on both sides of
-    the exact boundary.
+    """Complementary case to the just-inside test above: a row just
+    *over* the TTL (by a 10-second margin, not a whole extra day) is
+    stale. Together these two catch a day-count/off-by-one regression
+    in `CVE_CACHE_TTL_DAYS` -- see that test's docstring for why a
+    margin-based test like this one cannot, by itself, distinguish a
+    `>` vs `>=` operator choice in `is_stale`.
     """
     entry = CveCache(cpe=CPE23, total_results=0, cves=[])
     db.add(entry)
@@ -130,6 +138,47 @@ def test_is_stale_true_just_outside_ttl_boundary(db: Session) -> None:
     db.refresh(entry)
 
     assert is_stale(entry) is True
+
+
+def test_is_stale_false_at_exact_ttl_boundary() -> None:
+    """Deterministically tests the single exact point where `>` and
+    `>=` disagree: an entry whose age is *exactly* `CVE_CACHE_TTL_DAYS`
+    (to the microsecond) must be considered fresh, since `is_stale`
+    uses a strict `>` comparison. No margin-based test using the real
+    wall clock can probe this exact instant (see the two tests above),
+    so `datetime.now(UTC)` inside `cache.py` is patched to a fixed
+    value instead, making "now" fully deterministic. `is_stale` itself
+    takes no `db` session, so this needs no `db` fixture either --
+    `entry` is a plain in-memory object, never persisted.
+    """
+    fixed_now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
+    entry = CveCache(cpe=CPE23, total_results=0, cves=[])
+    entry.fetched_at = fixed_now - timedelta(days=CVE_CACHE_TTL_DAYS)
+
+    with patch("app.modules.vulnerability.cache.datetime") as mock_datetime:
+        mock_datetime.now.return_value = fixed_now
+        assert is_stale(entry) is False
+    mock_datetime.now.assert_called_once_with(UTC)
+
+
+def test_is_stale_true_one_microsecond_past_exact_ttl_boundary() -> None:
+    """Complementary case to the exact-boundary test above: one
+    microsecond past the exact `CVE_CACHE_TTL_DAYS` instant flips
+    `is_stale` to `True`. Together these two tests pin down the `>`
+    (not `>=`) operator choice itself, deterministically -- a `>` ->
+    `>=` regression would flip the *previous* test's expectation to
+    `True` (since `elapsed == CVE_CACHE_TTL_DAYS` would then also
+    count as stale), while this test would still pass either way,
+    which is exactly why both tests are needed together.
+    """
+    fixed_now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
+    entry = CveCache(cpe=CPE23, total_results=0, cves=[])
+    entry.fetched_at = fixed_now - timedelta(days=CVE_CACHE_TTL_DAYS) - timedelta(microseconds=1)
+
+    with patch("app.modules.vulnerability.cache.datetime") as mock_datetime:
+        mock_datetime.now.return_value = fixed_now
+        assert is_stale(entry) is True
+    mock_datetime.now.assert_called_once_with(UTC)
 
 
 def test_store_twice_upserts_instead_of_duplicating(db: Session) -> None:
