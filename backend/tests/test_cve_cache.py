@@ -182,6 +182,13 @@ def test_is_stale_true_one_microsecond_past_exact_ttl_boundary() -> None:
 
 
 def test_store_twice_upserts_instead_of_duplicating(db: Session) -> None:
+    """Also the deterministic, non-concurrent proof that `store()`'s
+    `INSERT ... ON CONFLICT (cpe) DO UPDATE` path (the final-review fix
+    for the concurrent-insert race -- see PLAN_4_TASKS/final-review-fix-
+    report.md finding 3) actually updates in place rather than raising:
+    a second `store()` call for a `cpe` that already has a row must hit
+    the `ON CONFLICT` branch and succeed, not an `IntegrityError`.
+    """
     first_cves = _make_cves()
     store(db, CPE23, first_cves, total_results=2)
 
