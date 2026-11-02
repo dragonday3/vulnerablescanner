@@ -28,9 +28,23 @@ conventions below should track reality, not the plan that predates it.
   `GET /scans/{id}/assets` endpoint and the project's first frontend
   results view (`/projects/[projectId]/scans/[scanId]`) expose it. See
   `PLAN_3.md` / `PLAN_3_TASKS.md`.
-- **Phase 4+** (vulnerability correlation, misconfiguration, risk
-  scoring, reporting) — not started. Placeholder empty packages already
-  exist under `backend/app/modules/` for each.
+- **Phase 4** (Vulnerability Correlation) — done, merged to `main`. For
+  every nmap-sourced `Service` with CPE evidence, correlates against the
+  NVD CVE API 2.0 (cached locally in `cve_cache`, keyed by CPE string,
+  7-day TTL) and persists matches as `Finding` rows. A new
+  `ScanStatus.CORRELATING` stage, a Redis Lua-script rate limiter (see
+  below), and `findings` nested onto the existing results endpoint/page
+  with severity badges + NVD links. Native-scanner/HTTP-prober services
+  never get findings — no CPE evidence exists for them, by design. See
+  `PLAN_4.md` / `PLAN_4_TASKS.md`.
+- **Phase 5+** (confidence/validation, misconfiguration, risk scoring,
+  reporting) — not started. Placeholder empty packages already exist
+  under `backend/app/modules/` for each. Known, deliberately deferred
+  gaps from Phase 4 for whichever phase picks them up: CVSS v4
+  (`cvssMetricV40`) isn't read, so a V4-only-scored CVE shows severity
+  `NONE`; a scan with zero findings looks identical whether that's a
+  genuinely clean result or a correlation failure (NVD outage, rate-limit
+  timeout) — no per-scan outcome/confidence tracking yet.
 - No CI configured yet. No GitHub remote existed until this was pushed
   manually — verify `git remote -v` / `.github/` before assuming any
   pipeline exists.
@@ -87,6 +101,36 @@ conventions below should track reality, not the plan that predates it.
   `--webpack` in `frontend/package.json` — Turbopack has a route-discovery
   bug with nested dynamic routes under this project's Docker/Windows
   bind-mount setup (see README's Windows-specific notes).
+- **Vulnerability correlation** (`backend/app/modules/vulnerability/`):
+  `correlator.py` filters `Service` rows by "does `evidence` have a
+  non-empty `cpe` key" (never by `scanner_name`), converts each CPE
+  2.2→2.3 (`cpe_utils.py`), dedups identical CPEs within one scan, caps
+  at 25 distinct CPEs/scan, and commits once per distinct CPE — not
+  batched at the end — with its own per-CPE `try/except` so one CPE's
+  failure never aborts the rest of the scan's correlation. Correlation
+  failures (like fingerprinting's) can never flip a scan to `FAILED`.
+  `nvd_client.py` talks to the live NVD CVE API 2.0 — this is the
+  **second** outbound-network-call surface this project makes (alongside
+  the HTTP prober), and the worker container needs real internet access
+  for it to do anything. **Redis is now a direct dependency, not just the
+  Celery broker**: `rate_limiter.py`'s `NvdRateLimiter` uses a single
+  global Redis key (`vulnsight:nvd:ratelimit`) and a Lua script to make
+  the whole check-trim-claim sequence atomic across the worker's ~12
+  concurrent prefork processes — NVD's 5-req/30s keyless limit is global,
+  not per-process, so a per-task `time.sleep()` would not coordinate it;
+  never add a second ad hoc throttle alongside this one. `cache.py`'s
+  `store()` is structurally unable to cache a failed lookup (its own type
+  signature excludes `None` — `fetch_cves_for_cpe` returns `[]` for a
+  genuine zero-CVE success vs. `None` for literally any failure), and is
+  itself an atomic upsert (`ON CONFLICT DO UPDATE`) since concurrent scans
+  can race on the same new CPE. **Trust the live API's actual shape over
+  how it looks in a mock**: two real bugs shipped from exactly that gap —
+  NVD rejecting `isVulnerable=true` (needs `isVulnerable=""`), and CVSS
+  v2's `baseSeverity` living beside `cvssData` on the metric object, not
+  nested inside it (unlike v3) — both were invisible to every mocked unit
+  test and only surfaced via a real live NVD call. Backend tests need a
+  reachable Redis (`TEST_REDIS_URL`, defaults to `REDIS_URL` on DB index
+  15) in addition to the Postgres test database.
 
 ## Running it
 
