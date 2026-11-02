@@ -2,6 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import StatusBadge from "@/components/StatusBadge";
 import FingerprintBadge from "@/components/FingerprintBadge";
+import SeverityBadge from "@/components/SeverityBadge";
 import { getScan, getScanAssets } from "@/lib/api/scans";
 import { listTargets } from "@/lib/api/targets";
 import type { ScanRead } from "@/lib/types/scan";
@@ -196,6 +197,31 @@ export default async function ScanResultsPage({
                               {JSON.stringify(service.evidence, null, 2)}
                             </pre>
                           </details>
+                          {service.findings.length > 0 && (
+                            <div className="mt-2 flex flex-col gap-1">
+                              {service.findings.map((finding) => (
+                                <div
+                                  key={finding.id}
+                                  className="flex flex-wrap items-center gap-1.5"
+                                >
+                                  <SeverityBadge severity={finding.severity} />
+                                  <a
+                                    href={`https://nvd.nist.gov/vuln/detail/${finding.cve_id}`}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="font-mono text-xs text-blue-600 hover:underline"
+                                  >
+                                    {finding.cve_id}
+                                  </a>
+                                  {finding.cvss_score != null && (
+                                    <span className="text-xs text-zinc-500">
+                                      (CVSS {finding.cvss_score})
+                                    </span>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
                         </td>
                       </tr>
                     ))}

@@ -2,6 +2,9 @@ import logging
 import uuid
 from datetime import UTC, datetime
 
+import redis
+
+from app.core.config import get_settings
 from app.core.logging import scan_id_var
 from app.db.session import SessionLocal
 from app.models.asset import Asset
@@ -13,6 +16,7 @@ from app.modules.discovery.interfaces import PortScannerInterface
 from app.modules.discovery.native_scanner import NativePortScanner
 from app.modules.discovery.nmap_scanner import NmapPortScanner
 from app.modules.fingerprinting.http_prober import WEB_PORTS, probe_services
+from app.modules.vulnerability.correlator import correlate_services
 from app.workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -257,7 +261,28 @@ def run_scan_task(scan_id: str) -> None:
             db.rollback()
             logger.exception("run_scan_task: scan %s HTTP fingerprinting failed", scan_id)
 
-        # Step 10: unchanged.
+        # Step 10 (Phase 4): CORRELATING. A new, separate try/except, same
+        # shape as Step 9's: fingerprinting/correlation failures must never
+        # fail the scan, so any exception here is logged and swallowed - no
+        # scan.status mutation, no return, always falls through to
+        # COMPLETED below. Unlike Step 9's native-only guard, this runs for
+        # BOTH adapters uniformly: only nmap-adapter Service rows will ever
+        # actually have evidence["cpe"], but correlate_services's own
+        # filtering (not a scanner_name check here) is what decides that -
+        # keeping this call unconditional means a future adapter that
+        # somehow also produces CPE evidence doesn't need this call site
+        # touched again, matching the FINGERPRINTING transition's own
+        # existing adapter-agnostic status-machine precedent.
+        scan.status = ScanStatus.CORRELATING
+        db.commit()
+        try:
+            redis_client = redis.Redis.from_url(get_settings().REDIS_URL)
+            correlate_services(db, redis_client, services)
+        except Exception:
+            db.rollback()
+            logger.exception("run_scan_task: scan %s vulnerability correlation failed", scan_id)
+
+        # Step 11: unchanged (was Step 10).
         scan.status = ScanStatus.COMPLETED
         scan.completed_at = datetime.now(UTC)
         db.commit()

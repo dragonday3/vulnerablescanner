@@ -626,3 +626,104 @@ def test_fingerprinting_is_reached_as_an_intermediate_status(
 
     db.refresh(scan)
     assert scan.status == ScanStatus.COMPLETED
+
+
+# --- Phase 4: CORRELATING transition + correlate_services wiring ---
+#
+# `correlator.correlate_services` itself is mocked at this level (not its
+# internals, which is test_correlator.py's job) to keep this file's
+# existing "no real network, no real Redis" character — these tests are
+# purely about the orchestration wiring in run_scan_task, not about
+# correlation logic.
+
+
+@pytest.mark.parametrize("scanner_name", ["native", "nmap"])
+def test_correlating_is_reached_as_an_intermediate_status(
+    db: Session,
+    use_test_session: None,
+    monkeypatch: pytest.MonkeyPatch,
+    scanner_name: str,
+) -> None:
+    """CORRELATING must actually be set (and committed) as an intermediate
+    state for both adapters, not skipped straight to COMPLETED — mirrors
+    the FINGERPRINTING test above, same spy-on-db.commit technique.
+    """
+    scan = _make_scan(db, value="127.0.0.1", config={"scanner": scanner_name})
+    fake_results = [PortScanResult(port=22, protocol="tcp", state="open")]
+
+    observed_statuses: list[ScanStatus] = []
+    original_commit = db.commit
+
+    def spy_commit() -> None:
+        observed_statuses.append(scan.status)
+        original_commit()
+
+    monkeypatch.setattr(db, "commit", spy_commit)
+
+    adapter_cls = NativePortScanner if scanner_name == "native" else NmapPortScanner
+    with (
+        patch.object(adapter_cls, "scan", return_value=fake_results),
+        patch.object(tasks_module, "correlate_services") as mock_correlate,
+    ):
+        tasks_module.run_scan_task(str(scan.id))
+
+    mock_correlate.assert_called_once()
+    assert ScanStatus.CORRELATING in observed_statuses
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.COMPLETED
+
+
+def test_correlate_services_failure_does_not_fail_scan(db: Session, use_test_session: None) -> None:
+    """The never-fail-the-scan contract, this stage's version: a
+    `correlate_services` exception must be caught, logged, and rolled
+    back — the scan still reaches COMPLETED with error_message still
+    None, mirroring the equivalent Phase 3 fingerprinting test.
+    """
+    scan = _make_scan(db, value="127.0.0.1")
+    fake_results = [PortScanResult(port=80, protocol="tcp", state="open")]
+
+    with (
+        patch.object(NativePortScanner, "scan", return_value=fake_results),
+        patch.object(
+            tasks_module, "correlate_services", side_effect=RuntimeError("correlation boom")
+        ) as mock_correlate,
+    ):
+        tasks_module.run_scan_task(str(scan.id))
+
+    mock_correlate.assert_called_once()
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.COMPLETED
+    assert scan.completed_at is not None
+    assert scan.error_message is None
+
+
+@pytest.mark.parametrize("scanner_name", ["native", "nmap"])
+def test_correlate_services_called_with_full_services_list_regardless_of_adapter(
+    db: Session, use_test_session: None, scanner_name: str
+) -> None:
+    """No `scanner_name == "native"` guard at this call site (unlike Step
+    9's native-only guard): `correlate_services` must be invoked
+    unconditionally, with the FULL `services` list, for both adapters —
+    its own internal CPE-presence filtering is what matters, not a
+    scanner check here (covered by test_correlator.py, not re-tested
+    here).
+    """
+    scan = _make_scan(db, value="127.0.0.1", config={"scanner": scanner_name})
+    fake_results = [
+        PortScanResult(port=22, protocol="tcp", state="open"),
+        PortScanResult(port=80, protocol="tcp", state="open"),
+    ]
+
+    adapter_cls = NativePortScanner if scanner_name == "native" else NmapPortScanner
+    with (
+        patch.object(adapter_cls, "scan", return_value=fake_results),
+        patch.object(tasks_module, "correlate_services") as mock_correlate,
+    ):
+        tasks_module.run_scan_task(str(scan.id))
+
+    mock_correlate.assert_called_once()
+    call_args = mock_correlate.call_args.args
+    passed_services = call_args[2]
+    assert {s.port for s in passed_services} == {22, 80}

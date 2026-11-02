@@ -10,6 +10,7 @@ from app.db.base_class import Base
 
 if TYPE_CHECKING:
     from app.models.asset import Asset
+    from app.models.finding import Finding
 
 
 class Service(Base):
@@ -43,3 +44,13 @@ class Service(Base):
     evidence: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     asset: Mapped["Asset"] = relationship(back_populates="services")
+
+    # order_by="Finding.cvss_score.desc()": worst-first display, same spirit
+    # as Asset.services' order_by="Service.port" keeping a stable,
+    # meaningful row order rather than heap order.
+    findings: Mapped[list["Finding"]] = relationship(
+        back_populates="service",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="Finding.cvss_score.desc()",
+    )

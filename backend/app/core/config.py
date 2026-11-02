@@ -10,6 +10,12 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     CORS_ORIGINS: list[str] = ["http://localhost:3000"]
     API_V1_PREFIX: str = "/api/v1"
+    # Unset by default (NVD's keyless public rate limit is what
+    # NvdRateLimiter's defaults assume). When set, nvd_client.py adds it as
+    # an `apiKey` request header, which raises NVD's rate limit -- not
+    # wired up to anything higher yet this phase, just read defensively so
+    # a future key just works.
+    NVD_API_KEY: str | None = None
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

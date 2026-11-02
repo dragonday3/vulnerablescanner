@@ -7,6 +7,7 @@ from app.core.exceptions import NotFoundError, ScanStateError, ValidationConflic
 from app.models.asset import Asset
 from app.models.project import Project
 from app.models.scan import Scan, ScanStatus
+from app.models.service import Service
 from app.models.target import Target
 from app.schemas.scan import ScanCreate
 from app.workers.celery_app import celery_app
@@ -87,7 +88,7 @@ def get_scan_assets(db: Session, scan_id: uuid.UUID) -> list[Asset]:
     get_scan(db, scan_id)  # raises NotFoundError if the scan itself doesn't exist
     return (
         db.query(Asset)
-        .options(selectinload(Asset.services))
+        .options(selectinload(Asset.services).selectinload(Service.findings))
         .filter(Asset.scan_id == scan_id)
         .order_by(Asset.created_at)
         .all()

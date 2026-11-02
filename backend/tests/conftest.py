@@ -30,8 +30,10 @@ constraint/SQL issues.
 import os
 from collections.abc import Generator
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
+import redis
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL, Engine, make_url
@@ -53,6 +55,20 @@ TEST_DATABASE_URL = os.environ.setdefault(
     # render_as_string(hide_password=False): plain str(URL) masks the
     # password as "***", which would make the derived URL unusable.
     make_url(_DATABASE_URL).set(database="vulnsight_test").render_as_string(hide_password=False),
+)
+
+# Same env-var-with-default pattern as DATABASE_URL/TEST_DATABASE_URL above,
+# mirrored for Redis: a dedicated test database index (15) on the same
+# Redis server as dev, rather than a whole separate database name (Redis
+# doesn't have those — numbered logical databases are the equivalent of
+# the Postgres "vulnsight" / "vulnsight_test" split). This is safe to
+# `flushdb()` freely in tests specifically *because* it's a dedicated
+# index, never index 0, which is what the real Celery broker/backend and
+# the app's rate limiter actually use.
+_REDIS_URL = os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
+TEST_REDIS_URL = os.environ.setdefault(
+    "TEST_REDIS_URL",
+    urlunsplit(urlsplit(_REDIS_URL)._replace(path="/15")),
 )
 
 from app.db.base_class import Base  # noqa: E402
@@ -105,6 +121,45 @@ def db() -> Generator[Session, None, None]:
         session.close()
         trans.rollback()
         connection.close()
+
+
+# Mirrors `test_engine` above: the Redis connection is created once, at
+# import time, rather than per-test - `redis.Redis` is itself backed by
+# an internal connection pool, so this single client is the Redis
+# equivalent of the single `test_engine` Postgres connection pool.
+_test_redis_client: redis.Redis = redis.Redis.from_url(TEST_REDIS_URL, decode_responses=True)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _test_redis() -> Generator[None, None, None]:
+    """Session-scoped counterpart to `_test_database` above. Confirms
+    `_test_redis_client` can actually reach the dedicated test Redis
+    index once, up front - so an unreachable TEST_REDIS_URL/REDIS_URL
+    fails loudly at session setup via `redis.ConnectionError`, not
+    silently - and closes it once the whole session is done. Per-test
+    isolation is handled separately by the function-scoped
+    `redis_client` fixture below, which reuses this same connection
+    rather than opening a new one per test.
+    """
+    _test_redis_client.ping()
+    yield
+    _test_redis_client.close()
+
+
+@pytest.fixture()
+def redis_client() -> Generator[redis.Redis, None, None]:
+    """Per-test isolation layered on top of the one shared
+    session-scoped connection (`_test_redis_client`): `flushdb()`
+    before and after each test, rather than constructing/closing a
+    fresh client per test - mirroring how the Postgres `db` fixture
+    checks a connection out of the already-created `test_engine` pool
+    per test instead of recreating the engine itself each time.
+    """
+    _test_redis_client.flushdb()
+    try:
+        yield _test_redis_client
+    finally:
+        _test_redis_client.flushdb()
 
 
 @pytest.fixture()

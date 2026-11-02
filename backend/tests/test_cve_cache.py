@@ -1,0 +1,215 @@
+"""Tests for the `cve_cache` check/store/staleness module.
+
+Pure DB logic: uses the existing `db` fixture from `conftest.py`, no
+Redis/HTTP touched at all.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
+
+from sqlalchemy.orm import Session
+
+from app.models.cve_cache import CveCache
+from app.modules.vulnerability.cache import CVE_CACHE_TTL_DAYS, get_cached, is_stale, store
+from app.modules.vulnerability.nvd_client import NormalizedCve
+
+CPE23 = "cpe:2.3:a:nginx:nginx:1.24.0:*:*:*:*:*:*:*"
+
+
+def _make_cves() -> list[NormalizedCve]:
+    return [
+        NormalizedCve(
+            cve_id="CVE-2021-41773",
+            description="Path traversal in Apache HTTP Server 2.4.49",
+            severity="CRITICAL",
+            cvss_score=9.8,
+            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            references=["https://httpd.apache.org/security/vulnerabilities_24.html"],
+            raw={"id": "CVE-2021-41773", "sourceIdentifier": "cve@mitre.org", "nested": {"a": 1}},
+        ),
+        NormalizedCve(
+            cve_id="CVE-2021-42013",
+            description=None,
+            severity="NONE",
+            cvss_score=None,
+            cvss_vector=None,
+            references=[],
+            raw={"id": "CVE-2021-42013"},
+        ),
+    ]
+
+
+def test_get_cached_returns_none_on_miss(db: Session) -> None:
+    assert get_cached(db, "cpe:2.3:a:nonexistent:nonexistent:1.0:*:*:*:*:*:*:*") is None
+
+
+def test_store_then_get_round_trips_every_field(db: Session) -> None:
+    cves = _make_cves()
+    stored = store(db, CPE23, cves, total_results=2)
+
+    assert isinstance(stored, CveCache)
+    assert stored.cpe == CPE23
+    assert stored.total_results == 2
+
+    fetched = get_cached(db, CPE23)
+    assert fetched is not None
+    assert fetched.cpe == CPE23
+    assert fetched.total_results == 2
+    assert len(fetched.cves) == 2
+
+    for original, round_tripped in zip(cves, fetched.cves, strict=True):
+        assert round_tripped["cve_id"] == original.cve_id
+        assert round_tripped["description"] == original.description
+        assert round_tripped["severity"] == original.severity
+        assert round_tripped["cvss_score"] == original.cvss_score
+        assert round_tripped["cvss_vector"] == original.cvss_vector
+        assert round_tripped["references"] == original.references
+        assert round_tripped["raw"] == original.raw
+
+
+def test_is_stale_true_past_ttl(db: Session) -> None:
+    entry = CveCache(cpe=CPE23, total_results=0, cves=[])
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+
+    # Direct DB manipulation, not through store(), since store() sets
+    # fetched_at to "now" -- this backdates it past the TTL boundary.
+    entry.fetched_at = datetime.now(UTC) - timedelta(days=CVE_CACHE_TTL_DAYS + 1)
+    db.commit()
+    db.refresh(entry)
+
+    assert is_stale(entry) is True
+
+
+def test_is_stale_false_for_freshly_stored_row(db: Session) -> None:
+    entry = store(db, CPE23, [], total_results=0)
+    assert is_stale(entry) is False
+
+
+def test_is_stale_false_just_inside_ttl_boundary(db: Session) -> None:
+    """A row that is `CVE_CACHE_TTL_DAYS` days old minus a 10-second
+    margin is still fresh. This (and its complementary case below) uses
+    real wall-clock time with a 10-second margin on each side of the
+    nominal boundary, which is enough to reliably catch a day-count /
+    off-by-one regression in `CVE_CACHE_TTL_DAYS` -- but a margin-based
+    test like this one is structurally unable to distinguish `>` from
+    `>=` in `is_stale`'s own comparison: both operators agree at every
+    point except the single exact instant `elapsed == CVE_CACHE_TTL_DAYS`,
+    and any nonzero margin necessarily lands outside that single point.
+    See `test_is_stale_false_at_exact_ttl_boundary` /
+    `test_is_stale_true_one_microsecond_past_exact_ttl_boundary` below
+    for a deterministic test of that exact-equality operator choice,
+    using a mocked "now" rather than the real wall clock.
+    """
+    entry = CveCache(cpe=CPE23, total_results=0, cves=[])
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+
+    entry.fetched_at = (
+        datetime.now(UTC) - timedelta(days=CVE_CACHE_TTL_DAYS) + timedelta(seconds=10)
+    )
+    db.commit()
+    db.refresh(entry)
+
+    assert is_stale(entry) is False
+
+
+def test_is_stale_true_just_outside_ttl_boundary(db: Session) -> None:
+    """Complementary case to the just-inside test above: a row just
+    *over* the TTL (by a 10-second margin, not a whole extra day) is
+    stale. Together these two catch a day-count/off-by-one regression
+    in `CVE_CACHE_TTL_DAYS` -- see that test's docstring for why a
+    margin-based test like this one cannot, by itself, distinguish a
+    `>` vs `>=` operator choice in `is_stale`.
+    """
+    entry = CveCache(cpe=CPE23, total_results=0, cves=[])
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+
+    entry.fetched_at = (
+        datetime.now(UTC) - timedelta(days=CVE_CACHE_TTL_DAYS) - timedelta(seconds=10)
+    )
+    db.commit()
+    db.refresh(entry)
+
+    assert is_stale(entry) is True
+
+
+def test_is_stale_false_at_exact_ttl_boundary() -> None:
+    """Deterministically tests the single exact point where `>` and
+    `>=` disagree: an entry whose age is *exactly* `CVE_CACHE_TTL_DAYS`
+    (to the microsecond) must be considered fresh, since `is_stale`
+    uses a strict `>` comparison. No margin-based test using the real
+    wall clock can probe this exact instant (see the two tests above),
+    so `datetime.now(UTC)` inside `cache.py` is patched to a fixed
+    value instead, making "now" fully deterministic. `is_stale` itself
+    takes no `db` session, so this needs no `db` fixture either --
+    `entry` is a plain in-memory object, never persisted.
+    """
+    fixed_now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
+    entry = CveCache(cpe=CPE23, total_results=0, cves=[])
+    entry.fetched_at = fixed_now - timedelta(days=CVE_CACHE_TTL_DAYS)
+
+    with patch("app.modules.vulnerability.cache.datetime") as mock_datetime:
+        mock_datetime.now.return_value = fixed_now
+        assert is_stale(entry) is False
+    mock_datetime.now.assert_called_once_with(UTC)
+
+
+def test_is_stale_true_one_microsecond_past_exact_ttl_boundary() -> None:
+    """Complementary case to the exact-boundary test above: one
+    microsecond past the exact `CVE_CACHE_TTL_DAYS` instant flips
+    `is_stale` to `True`. Together these two tests pin down the `>`
+    (not `>=`) operator choice itself, deterministically -- a `>` ->
+    `>=` regression would flip the *previous* test's expectation to
+    `True` (since `elapsed == CVE_CACHE_TTL_DAYS` would then also
+    count as stale), while this test would still pass either way,
+    which is exactly why both tests are needed together.
+    """
+    fixed_now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
+    entry = CveCache(cpe=CPE23, total_results=0, cves=[])
+    entry.fetched_at = fixed_now - timedelta(days=CVE_CACHE_TTL_DAYS) - timedelta(microseconds=1)
+
+    with patch("app.modules.vulnerability.cache.datetime") as mock_datetime:
+        mock_datetime.now.return_value = fixed_now
+        assert is_stale(entry) is True
+    mock_datetime.now.assert_called_once_with(UTC)
+
+
+def test_store_twice_upserts_instead_of_duplicating(db: Session) -> None:
+    """Also the deterministic, non-concurrent proof that `store()`'s
+    `INSERT ... ON CONFLICT (cpe) DO UPDATE` path (the final-review fix
+    for the concurrent-insert race -- see PLAN_4_TASKS/final-review-fix-
+    report.md finding 3) actually updates in place rather than raising:
+    a second `store()` call for a `cpe` that already has a row must hit
+    the `ON CONFLICT` branch and succeed, not an `IntegrityError`.
+    """
+    first_cves = _make_cves()
+    store(db, CPE23, first_cves, total_results=2)
+
+    second_cves = [
+        NormalizedCve(
+            cve_id="CVE-2022-99999",
+            description="A different, later result for the same CPE",
+            severity="MEDIUM",
+            cvss_score=5.3,
+            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+            references=["https://example.com/advisory"],
+            raw={"id": "CVE-2022-99999"},
+        )
+    ]
+    store(db, CPE23, second_cves, total_results=1)
+
+    rows = db.query(CveCache).filter(CveCache.cpe == CPE23).all()
+    assert len(rows) == 1
+
+    only_row = rows[0]
+    assert only_row.total_results == 1
+    assert len(only_row.cves) == 1
+    assert only_row.cves[0]["cve_id"] == "CVE-2022-99999"
+    assert only_row.cves[0]["severity"] == "MEDIUM"

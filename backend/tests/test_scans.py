@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.models.asset import Asset
+from app.models.finding import Finding
 from app.models.scan import Scan, ScanStatus
 from app.models.service import Service
 from app.models.target import Target
@@ -341,6 +342,8 @@ def test_get_scan_assets_returns_nested_assets_and_services_with_fingerprint_fie
         "raw": "nginx/1.24.0",
     }
 
+    assert fingerprinted["findings"] == []
+
     bare = services_by_port[22]
     assert bare["service_name"] == "ssh"
     assert bare["product"] is None
@@ -348,6 +351,94 @@ def test_get_scan_assets_returns_nested_assets_and_services_with_fingerprint_fie
     assert bare["extrainfo"] is None
     assert bare["fingerprint_source"] is None
     assert bare["evidence"] is None
+    assert bare["findings"] == []
+
+
+def test_get_scan_assets_returns_nested_findings_for_correlated_service(
+    client: TestClient, db: Session
+) -> None:
+    """Task 6's contract: `GET /scans/{id}/assets` nests `findings` under the
+    matching `Service`, with every `FindingRead` field round-tripping real
+    (not just non-None-by-coincidence) values through the DB -> ORM ->
+    Pydantic -> JSON pipeline, and a service with zero `Finding` rows comes
+    back with `"findings": []` - a present, empty list, never an omitted key
+    or `null`.
+    """
+    ctx = _create_authorized_target(client)
+    scan = _create_scan(client, ctx)
+
+    asset = Asset(
+        project_id=uuid.UUID(ctx["project"]["id"]),
+        target_id=uuid.UUID(ctx["target"]["id"]),
+        scan_id=uuid.UUID(scan["id"]),
+        host="10.0.0.10",
+    )
+    db.add(asset)
+    db.flush()
+
+    correlated_service = Service(
+        asset_id=asset.id,
+        port=80,
+        protocol="tcp",
+        state="open",
+        service_name="http",
+        product="Apache httpd",
+        version="2.4.49",
+        fingerprint_source="nmap-sv",
+        evidence={"cpe": ["cpe:/a:apache:http_server:2.4.49"]},
+    )
+    uncorrelated_service = Service(
+        asset_id=asset.id,
+        port=22,
+        protocol="tcp",
+        state="open",
+        service_name="ssh",
+    )
+    db.add_all([correlated_service, uncorrelated_service])
+    db.flush()
+
+    finding = Finding(
+        service_id=correlated_service.id,
+        cve_id="CVE-2021-41773",
+        matched_cpe="cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*",
+        severity="CRITICAL",
+        cvss_score=9.8,
+        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        description="Path traversal and file disclosure in Apache HTTP Server 2.4.49.",
+        evidence={"id": "CVE-2021-41773", "sourceIdentifier": "nvd@nist.gov"},
+    )
+    db.add(finding)
+    db.commit()
+
+    resp = client.get(f"/api/v1/scans/{scan['id']}/assets")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    services_by_port = {s["port"]: s for s in body[0]["services"]}
+
+    correlated = services_by_port[80]
+    assert len(correlated["findings"]) == 1
+    finding_body = correlated["findings"][0]
+    assert finding_body["id"] == str(finding.id)
+    assert finding_body["service_id"] == str(correlated_service.id)
+    assert finding_body["cve_id"] == "CVE-2021-41773"
+    assert finding_body["matched_cpe"] == "cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*"
+    assert finding_body["severity"] == "CRITICAL"
+    assert finding_body["cvss_score"] == 9.8
+    assert finding_body["cvss_vector"] == "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    assert (
+        finding_body["description"]
+        == "Path traversal and file disclosure in Apache HTTP Server 2.4.49."
+    )
+    assert finding_body["evidence"] == {
+        "id": "CVE-2021-41773",
+        "sourceIdentifier": "nvd@nist.gov",
+    }
+    assert "created_at" in finding_body
+
+    uncorrelated = services_by_port[22]
+    assert uncorrelated["findings"] == []
 
 
 def test_get_scan_assets_returns_404_for_nonexistent_scan(client: TestClient) -> None:
