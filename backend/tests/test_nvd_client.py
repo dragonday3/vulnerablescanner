@@ -20,6 +20,7 @@ import redis
 
 from app.modules.vulnerability.nvd_client import (
     NVD_BASE_URL,
+    NVD_RESULTS_PER_PAGE,
     NormalizedCve,
     fetch_cves_for_cpe,
 )
@@ -91,9 +92,20 @@ _V30_METRICS = {
         {"cvssData": {"baseScore": 7.5, "baseSeverity": "HIGH", "vectorString": "CVSS:3.0/X"}}
     ]
 }
+# Real NVD shape for V2 metrics (confirmed live against the actual NVD
+# API, cpe:2.3:a:openbsd:openssh:7.4p1:*:*:*:*:*:*:*, CVE-2007-2768):
+# `baseSeverity` is a SIBLING of `cvssData` on the metric object itself,
+# NOT nested inside `cvssData` -- CVSS v2.0 doesn't define severity bands
+# at all, so NVD computes and attaches `baseSeverity` separately. A
+# previous version of this fixture incorrectly nested `baseSeverity`
+# inside `cvssData` (matching a bug in the old implementation instead of
+# the real API), which masked the bug this fixture now exercises.
 _V2_METRICS = {
     "cvssMetricV2": [
-        {"cvssData": {"baseScore": 5.0, "baseSeverity": "MEDIUM", "vectorString": "AV:N/X"}}
+        {
+            "cvssData": {"baseScore": 5.0, "vectorString": "AV:N/X"},
+            "baseSeverity": "MEDIUM",
+        }
     ]
 }
 
@@ -133,7 +145,9 @@ def test_fetch_cves_normal_response_parses_with_cvss_fallback_priority(monkeypat
 
     result = fetch_cves_for_cpe(CPE23, _FAKE_REDIS, rate_limiter=_NoopRateLimiter())
 
-    assert result == [
+    assert result is not None
+    assert result.total_results == len(body["vulnerabilities"])
+    assert result.cves == [
         NormalizedCve(
             cve_id="CVE-2024-0001",
             description="nginx overflow",
@@ -182,6 +196,105 @@ def test_fetch_cves_normal_response_parses_with_cvss_fallback_priority(monkeypat
     ]
 
 
+def test_fetch_cves_v2_only_cve_parses_correct_severity(monkeypatch) -> None:
+    """Regression test for the V2 `baseSeverity` location bug: a CPE
+    whose ONLY metrics are V2 (the real shape for many pre-~2016 CVEs)
+    must parse successfully with the correct severity/score/vector --
+    not raise (and get swallowed into a full-lookup-failure `None`) just
+    because `baseSeverity` lives beside `cvssData`, not inside it.
+    """
+    body = {
+        "vulnerabilities": [
+            _cve_entry(
+                "CVE-2007-6750",
+                descriptions=[{"lang": "en", "value": "a v2-only CVE"}],
+                metrics=_V2_METRICS,
+            )
+        ]
+    }
+    monkeypatch.setattr(httpx, "get", lambda *a, **kw: httpx.Response(200, json=body))
+
+    result = fetch_cves_for_cpe(CPE23, _FAKE_REDIS, rate_limiter=_NoopRateLimiter())
+
+    assert result is not None
+    assert result.cves == [
+        NormalizedCve(
+            cve_id="CVE-2007-6750",
+            description="a v2-only CVE",
+            severity="MEDIUM",
+            cvss_score=5.0,
+            cvss_vector="AV:N/X",
+            references=[],
+            raw=body["vulnerabilities"][0]["cve"],
+        )
+    ]
+
+
+def test_fetch_cves_one_malformed_cve_does_not_blind_the_whole_batch(monkeypatch) -> None:
+    """A single CVE with an unexpected/malformed metrics shape (e.g. a
+    `cvssMetricV2` entry that isn't a list of dicts) must degrade only
+    THAT cve's severity to "NONE"/None/None -- not raise and discard
+    every other CVE in the same NVD response for this CPE. This is the
+    direct fix for the bug where a V2-only CVE's `KeyError` (from reading
+    `baseSeverity` out of the wrong nested location) was caught by a
+    broad except that converted the ENTIRE cpe lookup into a `None`.
+    """
+    body = {
+        "vulnerabilities": [
+            _cve_entry("CVE-2024-GOOD", metrics=_V31_METRICS),
+            {"cve": {"id": "CVE-2024-WEIRD", "metrics": {"cvssMetricV2": "not-a-list"}}},
+        ]
+    }
+    monkeypatch.setattr(httpx, "get", lambda *a, **kw: httpx.Response(200, json=body))
+
+    result = fetch_cves_for_cpe(CPE23, _FAKE_REDIS, rate_limiter=_NoopRateLimiter())
+
+    assert result is not None
+    assert [cve.cve_id for cve in result.cves] == ["CVE-2024-GOOD", "CVE-2024-WEIRD"]
+    weird = result.cves[1]
+    assert weird.severity == "NONE"
+    assert weird.cvss_score is None
+    assert weird.cvss_vector is None
+
+
+def test_fetch_cves_total_results_from_response_not_len_of_parsed_list(monkeypatch) -> None:
+    """`total_results` must reflect NVD's own `totalResults` field, not
+    just `len(cves)` -- the whole point of this field (per PLAN_4.md) is
+    to let a later audit notice "NVD said there were 40 but we only
+    parsed/cached N", which is impossible if this is definitionally
+    always equal to the parsed list's length.
+    """
+    body = {
+        "totalResults": 40,
+        "vulnerabilities": [_cve_entry("CVE-2024-0001", metrics=_V31_METRICS)],
+    }
+    monkeypatch.setattr(httpx, "get", lambda *a, **kw: httpx.Response(200, json=body))
+
+    result = fetch_cves_for_cpe(CPE23, _FAKE_REDIS, rate_limiter=_NoopRateLimiter())
+
+    assert result is not None
+    assert result.total_results == 40
+    assert len(result.cves) == 1
+
+
+def test_fetch_cves_logs_warning_when_response_truncated(monkeypatch, caplog) -> None:
+    """When NVD's `totalResults` exceeds `NVD_RESULTS_PER_PAGE`, a warning
+    must be logged -- the audit signal the no-pagination scope limit
+    depends on an operator being able to grep for.
+    """
+    body = {
+        "totalResults": NVD_RESULTS_PER_PAGE + 1,
+        "vulnerabilities": [_cve_entry("CVE-2024-0001", metrics=_V31_METRICS)],
+    }
+    monkeypatch.setattr(httpx, "get", lambda *a, **kw: httpx.Response(200, json=body))
+
+    with caplog.at_level("WARNING"):
+        result = fetch_cves_for_cpe(CPE23, _FAKE_REDIS, rate_limiter=_NoopRateLimiter())
+
+    assert result is not None
+    assert any("truncated" in record.message for record in caplog.records)
+
+
 def test_fetch_cves_empty_vulnerabilities_returns_empty_list_not_none(monkeypatch) -> None:
     monkeypatch.setattr(
         httpx, "get", lambda *a, **kw: httpx.Response(200, json={"vulnerabilities": []})
@@ -189,7 +302,9 @@ def test_fetch_cves_empty_vulnerabilities_returns_empty_list_not_none(monkeypatc
 
     result = fetch_cves_for_cpe(CPE23, _FAKE_REDIS, rate_limiter=_NoopRateLimiter())
 
-    assert result == []
+    assert result is not None
+    assert result.cves == []
+    assert result.total_results == 0
 
 
 def test_fetch_cves_403_returns_none(monkeypatch) -> None:
@@ -296,7 +411,8 @@ def test_fetch_cves_no_rate_limiter_constructs_one_from_redis_client(monkeypatch
 
     result = fetch_cves_for_cpe(CPE23, _FAKE_REDIS)
 
-    assert result == []
+    assert result is not None
+    assert result.cves == []
     assert constructed_with == [_FAKE_REDIS]
 
 
