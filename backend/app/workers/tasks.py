@@ -16,6 +16,7 @@ from app.modules.discovery.interfaces import PortScannerInterface
 from app.modules.discovery.native_scanner import NativePortScanner
 from app.modules.discovery.nmap_scanner import NmapPortScanner
 from app.modules.fingerprinting.http_prober import WEB_PORTS, probe_services
+from app.modules.misconfiguration.analyzer import analyze_services
 from app.modules.vulnerability.correlator import correlate_services
 from app.workers.celery_app import celery_app
 
@@ -260,6 +261,21 @@ def run_scan_task(scan_id: str) -> None:
         except Exception:
             db.rollback()
             logger.exception("run_scan_task: scan %s HTTP fingerprinting failed", scan_id)
+
+        # Step 9.5 (Phase 6): ANALYZING. Same best-effort shape as Steps
+        # 9/10: analysis failures must never fail the scan, so any
+        # exception here is logged and swallowed - no scan.status
+        # mutation, no return, always falls through to CORRELATING below.
+        # Runs for BOTH adapters unconditionally (TLS/header/exposed-
+        # service checks are all orthogonal to which scanner found the
+        # port), same precedent as CORRELATING's own unconditional call.
+        scan.status = ScanStatus.ANALYZING
+        db.commit()
+        try:
+            analyze_services(db, services, target.value)
+        except Exception:
+            db.rollback()
+            logger.exception("run_scan_task: scan %s misconfiguration analysis failed", scan_id)
 
         # Step 10 (Phase 4): CORRELATING. A new, separate try/except, same
         # shape as Step 9's: fingerprinting/correlation failures must never
