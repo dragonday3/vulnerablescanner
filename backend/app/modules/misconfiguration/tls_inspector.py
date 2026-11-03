@@ -72,6 +72,18 @@ def _inspect_port(host: str, port: int, timeout_seconds: float) -> TlsInspection
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
+    # Same reasoning as CERT_NONE just above: this module sends no
+    # credentials and inspects certificates purely as passive evidence
+    # (mirroring http_prober.py's verify=False posture), so there is no
+    # security reason to refuse a legacy-TLS handshake. PROTOCOL_TLS_CLIENT
+    # otherwise defaults to minimum_version=TLSv1_2 and a SECLEVEL 2 cipher
+    # policy, which would make the handshake itself fail against a server
+    # limited to TLS 1.1/1.0 or older ciphers - silently producing zero
+    # findings for exactly the hosts the weak-tls-protocol check exists to
+    # flag. Refusing the handshake would hide the misconfiguration, not
+    # protect against it.
+    context.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
+    context.set_ciphers("ALL:@SECLEVEL=0")
     try:
         with socket.create_connection((host, port), timeout=timeout_seconds) as sock:
             with context.wrap_socket(sock, server_hostname=host) as tls_sock:

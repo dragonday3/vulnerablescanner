@@ -270,7 +270,9 @@ def test_tls_check_runs_once_per_scan_not_once_per_service(db: Session) -> None:
     """Two services both on TLS candidate ports (one via
     TLS_CANDIDATE_PORTS directly, one via the service_name heuristic on a
     non-standard port) must still result in exactly ONE `inspect_tls`
-    call for the whole scan.
+    call for the whole scan. The candidate set is also intersected with
+    this scan's actually-open ports, so 4443/8443 (no service open on
+    them here) are excluded even though they're in TLS_CANDIDATE_PORTS.
     """
     service_443 = _make_service(db, evidence=None, port=443)
     service_ssl_named = _make_service(db, evidence=None, port=9443, service_name="ssl/https-alt")
@@ -281,7 +283,7 @@ def test_tls_check_runs_once_per_scan_not_once_per_service(db: Session) -> None:
     mock_inspect.assert_called_once()
     called_host, called_ports = mock_inspect.call_args.args
     assert called_host == "127.0.0.1"
-    assert set(called_ports) == {443, 4443, 8443, 9443}
+    assert set(called_ports) == {443, 9443}
 
 
 def test_tls_check_applied_when_inspect_tls_returns_a_result_for_that_port(

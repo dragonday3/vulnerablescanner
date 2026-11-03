@@ -41,16 +41,21 @@ _TLS_SERVICE_NAME_RE = re.compile(r"ssl|https|tls", re.IGNORECASE)
 
 def _resolve_tls_candidate_ports(services: list[Service]) -> set[int]:
     """Step 1: `TLS_CANDIDATE_PORTS` unioned with every Service's own port
-    whose `service_name` matches /ssl|https|tls/i. Resolved once across
-    ALL of a scan's services, not per-service, so the caller can make
-    exactly one `inspect_tls` call for the whole scan.
+    whose `service_name` matches /ssl|https|tls/i, then intersected with
+    the set of ports this scan's services actually have open. Resolved
+    once across ALL of a scan's services, not per-service, so the caller
+    can make exactly one `inspect_tls` call for the whole scan. The
+    intersection avoids probing closed/irrelevant ports (e.g. the default
+    443/4443/8443 candidates when nothing in this scan actually has any
+    of them open).
     """
     candidate_ports = set(TLS_CANDIDATE_PORTS)
     for service in services:
         name = service.service_name
         if isinstance(name, str) and _TLS_SERVICE_NAME_RE.search(name):
             candidate_ports.add(service.port)
-    return candidate_ports
+    open_ports = {service.port for service in services}
+    return candidate_ports & open_ports
 
 
 def analyze_services(db: Session, services: list[Service], target_host: str) -> None:

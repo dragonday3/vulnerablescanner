@@ -145,9 +145,16 @@ def check_headers(service: Service) -> list[MisconfigCandidate]:
 
     set_cookie = _get_header(headers, "Set-Cookie")
     if isinstance(set_cookie, str):
-        lowered = set_cookie.lower()
-        missing_httponly = "httponly" not in lowered
-        missing_secure = scheme == "https" and "secure" not in lowered
+        # Parse into discrete `;`-separated attributes and compare each
+        # trimmed segment against the exact attribute name, rather than a
+        # raw substring search across the whole header value - a
+        # substring search would false-negative on a cookie whose own
+        # name/value happens to contain "secure" or "httponly" (e.g.
+        # `secure_session=...`), incorrectly treating the attribute as
+        # present when it isn't.
+        cookie_attrs = {segment.strip().lower() for segment in set_cookie.split(";")}
+        missing_httponly = "httponly" not in cookie_attrs
+        missing_secure = scheme == "https" and "secure" not in cookie_attrs
         if missing_httponly or missing_secure:
             if missing_httponly and missing_secure:
                 missing_desc = "the HttpOnly and Secure attributes"

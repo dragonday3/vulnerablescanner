@@ -20,6 +20,7 @@ fixture in the repo.
 import socket
 import ssl
 import threading
+import warnings
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -98,6 +99,59 @@ def _tls_server(cert_path: Path, key_path: Path) -> Generator[int, None, None]:
     """
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def _serve() -> None:
+        try:
+            conn, _addr = listener.accept()
+        except OSError:
+            return
+        try:
+            with context.wrap_socket(conn, server_side=True) as tls_conn:
+                try:
+                    tls_conn.recv(1)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    try:
+        yield port
+    finally:
+        listener.close()
+        thread.join(timeout=5)
+
+
+@contextmanager
+def _weak_tls_server(cert_path: Path, key_path: Path) -> Generator[int, None, None]:
+    """Mirrors `_tls_server` above, but caps the server side to TLS 1.1
+    and a SECLEVEL 0 cipher policy, so a real handshake against it
+    genuinely negotiates a weak/legacy protocol version - this is what
+    proves `_inspect_port`'s own `minimum_version`/`set_ciphers` override
+    (the fix under test) actually lets the handshake complete, rather
+    than failing with UNSUPPORTED_PROTOCOL the way the un-patched
+    PROTOCOL_TLS_CLIENT default would.
+
+    `ssl.TLSVersion.TLSv1_1` is deprecated in modern Python and may emit
+    a DeprecationWarning when set here (server-side test setup only,
+    unrelated to the production client code under test) - suppressed so
+    it can't fail the suite under `-W error`-style configs.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+        context.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
+        context.maximum_version = ssl.TLSVersion.TLSv1_1
+        context.set_ciphers("ALL:@SECLEVEL=0")
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))
@@ -339,6 +393,38 @@ def test_inspect_port_real_handshake_feeds_check_tls_result(tmp_path: Path) -> N
     assert result is not None
     candidates = check_tls_result(result)
     assert any(c.check_id == "self-signed-cert" for c in candidates)
+
+
+def test_inspect_port_real_weak_tls_handshake_flags_weak_protocol(tmp_path: Path) -> None:
+    """Reproduces the bug fixed in tls_inspector.py's `_inspect_port`:
+    `ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)` defaults to
+    `minimum_version=TLSv1_2` and a SECLEVEL 2 cipher policy, so without
+    the fix (`context.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED`
+    + `context.set_ciphers("ALL:@SECLEVEL=0")`), the handshake against a
+    server capped at TLS 1.1 fails outright with UNSUPPORTED_PROTOCOL and
+    `_inspect_port` returns None - meaning `weak-tls-protocol` could
+    never fire against a real legacy-TLS listener. This test exercises a
+    genuine handshake (real self-signed cert, real background-thread
+    socket server capped server-side to TLS 1.1 / SECLEVEL 0, real
+    client-side `_inspect_port` call) end to end through
+    `check_tls_result`, not a mocked/constructed result.
+    """
+    cert_path, key_path = _generate_self_signed_cert(tmp_path, common_name="127.0.0.1")
+
+    with _weak_tls_server(cert_path, key_path) as port:
+        result = _inspect_port("127.0.0.1", port, timeout_seconds=3.0)
+
+    assert result is not None
+    assert result.port == port
+    assert result.protocol_version is not None
+    assert result.protocol_version.startswith("TLSv1.1")
+
+    candidates = check_tls_result(result)
+    check_ids = {c.check_id for c in candidates}
+    assert "weak-tls-protocol" in check_ids
+    weak_candidate = next(c for c in candidates if c.check_id == "weak-tls-protocol")
+    assert weak_candidate.severity == "HIGH"
+    assert weak_candidate.evidence["protocol_version"] == result.protocol_version
 
 
 def test_inspect_port_no_listener_returns_none() -> None:
