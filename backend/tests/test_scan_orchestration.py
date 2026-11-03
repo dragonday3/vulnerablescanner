@@ -871,3 +871,132 @@ def test_unreachable_tls_candidate_port_still_reaches_completed(
     )
     tls_check_ids = {"self-signed-cert", "expired-cert", "expiring-soon-cert", "weak-tls-protocol"}
     assert not any(m.check_id in tls_check_ids for m in misconfigs)
+
+
+# --- Phase 7: RISK_ANALYSIS transition + score_assets wiring ---
+#
+# `risk_scorer.score_assets` itself is mocked at the wiring-test level
+# (not its internals, which is test_risk_scorer.py's job), mirroring how
+# the CORRELATING/ANALYZING sections above mock correlate_services/
+# analyze_services. The final test in this section runs the REAL
+# score_assets end to end to prove risk_score/risk_tier actually land on
+# both scan and asset after a full run.
+
+
+@pytest.mark.parametrize("scanner_name", ["native", "nmap"])
+def test_risk_analysis_is_reached_as_an_intermediate_status(
+    db: Session,
+    use_test_session: None,
+    monkeypatch: pytest.MonkeyPatch,
+    scanner_name: str,
+) -> None:
+    """RISK_ANALYSIS must actually be set (and committed) as an
+    intermediate state for both adapters, not skipped straight to
+    COMPLETED — mirrors the FINGERPRINTING/ANALYZING/CORRELATING tests
+    above, same spy-on-db.commit technique.
+    """
+    scan = _make_scan(db, value="127.0.0.1", config={"scanner": scanner_name})
+    fake_results = [PortScanResult(port=22, protocol="tcp", state="open")]
+
+    observed_statuses: list[ScanStatus] = []
+    original_commit = db.commit
+
+    def spy_commit() -> None:
+        observed_statuses.append(scan.status)
+        original_commit()
+
+    monkeypatch.setattr(db, "commit", spy_commit)
+
+    adapter_cls = NativePortScanner if scanner_name == "native" else NmapPortScanner
+    with (
+        patch.object(adapter_cls, "scan", return_value=fake_results),
+        patch.object(tasks_module, "score_assets") as mock_score_assets,
+    ):
+        tasks_module.run_scan_task(str(scan.id))
+
+    mock_score_assets.assert_called_once()
+    assert ScanStatus.RISK_ANALYSIS in observed_statuses
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.COMPLETED
+
+
+def test_score_assets_failure_does_not_fail_scan(db: Session, use_test_session: None) -> None:
+    """The never-fail-the-scan contract, this stage's version: a
+    `score_assets` exception must be caught, logged, and rolled back —
+    the scan still reaches COMPLETED with error_message still None,
+    mirroring the equivalent Phase 3/4/6 tests. Exercised against a real
+    monkeypatched-to-raise `score_assets`, not just asserted.
+    """
+    scan = _make_scan(db, value="127.0.0.1")
+    fake_results = [PortScanResult(port=80, protocol="tcp", state="open")]
+
+    with (
+        patch.object(NativePortScanner, "scan", return_value=fake_results),
+        patch.object(
+            tasks_module, "score_assets", side_effect=RuntimeError("risk scoring boom")
+        ) as mock_score_assets,
+    ):
+        tasks_module.run_scan_task(str(scan.id))
+
+    mock_score_assets.assert_called_once()
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.COMPLETED
+    assert scan.completed_at is not None
+    assert scan.error_message is None
+    # score_assets never ran for real -- risk_score/risk_tier stay unset.
+    assert scan.risk_score is None
+    assert scan.risk_tier is None
+
+
+def test_score_assets_called_with_single_asset_list(db: Session, use_test_session: None) -> None:
+    """`score_assets` must be invoked with `(db, scan, [asset])` -- the
+    single Asset ORM object already built earlier in the task, passed as
+    a one-element list (PLAN_7.md section 3's documented, deliberate
+    one-Asset-per-scan call-site shape).
+    """
+    scan = _make_scan(db, value="127.0.0.1")
+    fake_results = [PortScanResult(port=80, protocol="tcp", state="open")]
+
+    with (
+        patch.object(NativePortScanner, "scan", return_value=fake_results),
+        patch.object(tasks_module, "score_assets") as mock_score_assets,
+    ):
+        tasks_module.run_scan_task(str(scan.id))
+
+    mock_score_assets.assert_called_once()
+    call_args = mock_score_assets.call_args.args
+    passed_scan, passed_assets = call_args[1], call_args[2]
+    assert passed_scan.id == scan.id
+    assert len(passed_assets) == 1
+    asset = db.execute(select(Asset).where(Asset.scan_id == scan.id)).scalar_one()
+    assert passed_assets[0].id == asset.id
+
+
+def test_full_run_populates_risk_score_and_tier_on_scan_and_asset(
+    db: Session, use_test_session: None
+) -> None:
+    """End-to-end (real `score_assets`, real `nvd_client`/`analyzer` calls
+    mocked out only where those earlier stages would otherwise need real
+    network/Redis -- this test has no CPE evidence and no TLS candidate
+    port, so correlation/analysis naturally produce nothing to score):
+    a full `run_scan_task` run reaches COMPLETED with `risk_score`/
+    `risk_tier` populated (0.0/"NONE", since there are no findings or
+    misconfigurations) on both the scan and its asset.
+    """
+    scan = _make_scan(db, value="127.0.0.1")
+    fake_results = [PortScanResult(port=22, protocol="tcp", state="open")]
+
+    with patch.object(NativePortScanner, "scan", return_value=fake_results):
+        tasks_module.run_scan_task(str(scan.id))
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.COMPLETED
+    assert scan.error_message is None
+    assert scan.risk_score == 0.0
+    assert scan.risk_tier == "NONE"
+
+    asset = db.execute(select(Asset).where(Asset.scan_id == scan.id)).scalar_one()
+    assert asset.risk_score == 0.0
+    assert asset.risk_tier == "NONE"

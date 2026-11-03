@@ -17,6 +17,7 @@ from app.modules.discovery.native_scanner import NativePortScanner
 from app.modules.discovery.nmap_scanner import NmapPortScanner
 from app.modules.fingerprinting.http_prober import WEB_PORTS, probe_services
 from app.modules.misconfiguration.analyzer import analyze_services
+from app.modules.risk.risk_scorer import score_assets
 from app.modules.vulnerability.correlator import correlate_services
 from app.workers.celery_app import celery_app
 
@@ -297,6 +298,26 @@ def run_scan_task(scan_id: str) -> None:
         except Exception:
             db.rollback()
             logger.exception("run_scan_task: scan %s vulnerability correlation failed", scan_id)
+
+        # Step 10.5 (Phase 7): RISK_ANALYSIS. Same best-effort shape as Steps
+        # 9/9.5/10: scoring failures must never fail the scan, so any
+        # exception here is logged and swallowed -- no scan.status
+        # mutation, no return, always falls through to COMPLETED below.
+        # Sits in the slot the ScanStatus enum already reserved between
+        # CORRELATING and REPORT_GENERATION; REPORT_GENERATION itself isn't
+        # wired up yet (Phase 8), so this stage currently falls straight
+        # through to COMPLETED, same as ANALYZING fell straight through to
+        # CORRELATING before Phase 6 existed. `asset` is the single Asset
+        # ORM object already built in Steps 5-7 above (one Asset per
+        # non-CIDR scan today); passed as a one-element list for signature
+        # symmetry with correlate_services/analyze_services.
+        scan.status = ScanStatus.RISK_ANALYSIS
+        db.commit()
+        try:
+            score_assets(db, scan, [asset])
+        except Exception:
+            db.rollback()
+            logger.exception("run_scan_task: scan %s risk scoring failed", scan_id)
 
         # Step 11: unchanged (was Step 10).
         scan.status = ScanStatus.COMPLETED
