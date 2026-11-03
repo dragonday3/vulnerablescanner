@@ -37,14 +37,39 @@ conventions below should track reality, not the plan that predates it.
   with severity badges + NVD links. Native-scanner/HTTP-prober services
   never get findings — no CPE evidence exists for them, by design. See
   `PLAN_4.md` / `PLAN_4_TASKS.md`.
-- **Phase 5+** (confidence/validation, misconfiguration, risk scoring,
-  reporting) — not started. Placeholder empty packages already exist
-  under `backend/app/modules/` for each. Known, deliberately deferred
-  gaps from Phase 4 for whichever phase picks them up: CVSS v4
-  (`cvssMetricV40`) isn't read, so a V4-only-scored CVE shows severity
-  `NONE`; a scan with zero findings looks identical whether that's a
-  genuinely clean result or a correlation failure (NVD outage, rate-limit
-  timeout) — no per-scan outcome/confidence tracking yet.
+- **Phase 5** (Confidence & Validation) — done, merged to `main`. Two
+  independent mechanisms added to `Finding` rows (they share a table,
+  nothing else): a continuous 0-100 `confidence_score` computed once per
+  `Service` (not once per `Finding`/CVE) from nmap's own `method`/`conf`
+  evidence by a pure function, `compute_confidence`
+  (`backend/app/modules/vulnerability/confidence.py`), wired into
+  `correlator.py`'s existing per-CPE loop; and an operator-settable
+  `validation_state` (`UNVALIDATED`/`CONFIRMED`/`FALSE_POSITIVE`) with an
+  optional free-text `validation_note` and a `validated_at` timestamp,
+  via a standalone `PATCH /findings/{id}`
+  (`backend/app/services/finding_service.py`,
+  `backend/app/api/routes/findings.py`) that never touches scan state.
+  Transitions are unrestricted (including back to `UNVALIDATED`, which
+  clears both `validation_note` and `validated_at`); a note is
+  full-replace on every PATCH, never merged with a prior one. The
+  migration backfills `confidence_score` for pre-existing rows with its
+  own inlined copy of the formula (migrations never import application
+  code — see Conventions). Frontend: confidence text, `ValidationBadge`,
+  and `FindingValidationControl` on the existing scan-results page;
+  false-positive findings get `opacity-50` + a struck-through CVE link,
+  never hidden entirely. See `PLAN_5.md` / `PLAN_5_TASKS.md`.
+- **Phase 6+** (misconfiguration, risk scoring, reporting) — not
+  started. Placeholder empty packages already exist under
+  `backend/app/modules/` for each. Known, deliberately deferred gaps for
+  whichever phase picks them up: CVSS v4 (`cvssMetricV40`) isn't read, so
+  a V4-only-scored CVE shows severity `NONE`; a scan with zero findings
+  looks identical whether that's a genuinely clean result or a
+  correlation failure (NVD outage, rate-limit timeout) — no per-scan
+  outcome tracking yet; `confidence_score`'s band constants
+  (`PROBED_FLOOR`/`TABLE_CEILING`/etc.) are a first-pass judgment call,
+  not tuned against real-world nmap scan data — Phase 5's final review
+  flagged that most real `-sV` probed matches cluster near 100.0, so
+  revisit the bands before leaning on this score for prioritization.
 - No CI configured yet. No GitHub remote existed until this was pushed
   manually — verify `git remote -v` / `.github/` before assuming any
   pipeline exists.
@@ -131,6 +156,19 @@ conventions below should track reality, not the plan that predates it.
   test and only surfaced via a real live NVD call. Backend tests need a
   reachable Redis (`TEST_REDIS_URL`, defaults to `REDIS_URL` on DB index
   15) in addition to the Postgres test database.
+- **Confidence & validation** (Phase 5): `confidence.py`'s
+  `compute_confidence` is a pure function — no DB/Redis/network, every
+  branch (missing `method`, missing/malformed/out-of-range `conf`)
+  returns a concrete float, never `None`, never raises. `correlator.py`
+  builds one `confidence_by_service` dict per distinct CPE (one call per
+  service, reused across that service's multiple `Finding`/CVE rows) —
+  never regress into calling it inside the full `(service, cve)`
+  comprehension. `finding_service.update_validation` never touches
+  `confidence_score`; `correlator.py` never touches
+  `validation_state`/`validation_note`/`validated_at` — keep these two
+  mechanisms independent even though they live on the same row. No
+  bulk/batch validation endpoint, no audit log beyond `validated_at`, no
+  automatic false-positive heuristics — deliberately out of scope.
 
 ## Running it
 
