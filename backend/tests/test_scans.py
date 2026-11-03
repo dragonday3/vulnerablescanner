@@ -406,6 +406,7 @@ def test_get_scan_assets_returns_nested_findings_for_correlated_service(
         cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
         description="Path traversal and file disclosure in Apache HTTP Server 2.4.49.",
         evidence={"id": "CVE-2021-41773", "sourceIdentifier": "nvd@nist.gov"},
+        confidence_score=100.0,
     )
     db.add(finding)
     db.commit()
