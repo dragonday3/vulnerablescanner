@@ -11,6 +11,7 @@ from app.db.base_class import Base
 if TYPE_CHECKING:
     from app.models.asset import Asset
     from app.models.finding import Finding
+    from app.models.misconfiguration import Misconfiguration
 
 
 class Service(Base):
@@ -53,4 +54,15 @@ class Service(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
         order_by="Finding.cvss_score.desc()",
+    )
+
+    # order_by created_at (insertion order), not a severity-sort
+    # expression — deliberately the simplest option; a worst-first
+    # sort is a frontend/API concern to add later if actually wanted,
+    # not something to build ahead of need.
+    misconfigurations: Mapped[list["Misconfiguration"]] = relationship(
+        back_populates="service",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="Misconfiguration.created_at",
     )
