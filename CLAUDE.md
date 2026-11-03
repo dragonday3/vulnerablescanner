@@ -58,18 +58,69 @@ conventions below should track reality, not the plan that predates it.
   and `FindingValidationControl` on the existing scan-results page;
   false-positive findings get `opacity-50` + a struck-through CVE link,
   never hidden entirely. See `PLAN_5.md` / `PLAN_5_TASKS.md`.
-- **Phase 6+** (misconfiguration, risk scoring, reporting) — not
-  started. Placeholder empty packages already exist under
-  `backend/app/modules/` for each. Known, deliberately deferred gaps for
-  whichever phase picks them up: CVSS v4 (`cvssMetricV40`) isn't read, so
-  a V4-only-scored CVE shows severity `NONE`; a scan with zero findings
-  looks identical whether that's a genuinely clean result or a
-  correlation failure (NVD outage, rate-limit timeout) — no per-scan
-  outcome tracking yet; `confidence_score`'s band constants
-  (`PROBED_FLOOR`/`TABLE_CEILING`/etc.) are a first-pass judgment call,
-  not tuned against real-world nmap scan data — Phase 5's final review
-  flagged that most real `-sV` probed matches cluster near 100.0, so
-  revisit the bands before leaning on this score for prioritization.
+- **Phase 6** (Misconfiguration Analysis) — done, merged to `main`.
+  Three independent check families, all producing rows on a new,
+  standalone `Misconfiguration` model (`backend/app/models/
+  misconfiguration.py` — deliberately not a `Finding` reuse, since
+  `Finding` is structurally CVE-specific): **header checks**
+  (`header_checks.py`, zero new network calls — reads
+  `Service.evidence["headers"]` already captured by Phase 3's HTTP
+  prober; missing HSTS/CSP/X-Frame-Options/X-Content-Type-Options, a
+  verbose `Server` header, insecure cookie flags); **exposed-service
+  checks** (`exposed_service_checks.py`, zero new network calls — a
+  static port→(label, severity) table lookup against commonly-
+  dangerous-to-expose services, e.g. Redis/MongoDB/the Docker Engine
+  API; never connects to verify anything, preserving the existing
+  no-banner-grabbing boundary from Phase 3); **TLS certificate
+  inspection** (`tls_inspector.py`, the one new active-probe surface
+  this phase introduces — the **third** outbound-network-call surface
+  in the project, alongside the HTTP prober and the NVD client). All
+  three are orchestrated by `analyzer.py` (mirrors `correlator.py`'s
+  per-unit commit/isolation discipline) inside `ScanStatus.ANALYZING`,
+  an enum value reserved-but-unused since Phase 1, now finally wired up
+  in `tasks.py` between `FINGERPRINTING` and `CORRELATING`. Analysis is
+  best-effort — same never-flip-to-`FAILED` contract as fingerprinting/
+  correlation. Surfaced read-only via the existing
+  `GET /scans/{id}/assets` (`misconfigurations` nested on `ServiceRead`,
+  eager-loaded alongside `findings`) and a sibling block on the scan-
+  results page. **Detection-only this phase, deliberately** — no
+  validation-state/confidence workflow, mirroring how `Finding` itself
+  shipped bare in Phase 4 before Phase 5 added that layer separately.
+  New runtime dependency: **`cryptography`** (DER-only certificate
+  parsing — Python's stdlib `ssl.getpeercert()` returns an empty dict
+  whenever the cert wasn't validated, which is always, by design, in
+  this module). `tls_inspector.py`'s `_inspect_port` deliberately sets
+  BOTH `verify_mode=ssl.CERT_NONE`/`check_hostname=False` (the whole
+  point is reading certs normal validation would reject — mirrors
+  `http_prober.py`'s `verify=False` posture) AND a lowered
+  `context.minimum_version`/permissive cipher policy — the latter fixed
+  late in this phase's final review: `PROTOCOL_TLS_CLIENT`'s *default*
+  minimum version (TLS 1.2) makes the handshake itself fail against a
+  legacy-TLS host, which silently produced zero TLS findings for
+  exactly the hosts most likely to have genuinely bad certs, and made
+  the `weak-tls-protocol` check undetectable in production — caught
+  only by testing against a real TLS listener, not by any mocked unit
+  test (the same "mocks hide the live shape" lesson as the NVD-client
+  bugs below). See `PLAN_6.md` / `PLAN_6_TASKS.md`.
+- **Phase 7+** (risk scoring, reporting) — not started. Placeholder
+  empty packages already exist under `backend/app/modules/` for each.
+  Known, deliberately deferred gaps for whichever phase picks them up:
+  CVSS v4 (`cvssMetricV40`) isn't read, so a V4-only-scored CVE shows
+  severity `NONE`; a scan with zero findings looks identical whether
+  that's a genuinely clean result or a correlation failure (NVD outage,
+  rate-limit timeout) — no per-scan outcome tracking yet;
+  `confidence_score`'s band constants (`PROBED_FLOOR`/`TABLE_CEILING`/
+  etc.) are a first-pass judgment call, not tuned against real-world
+  nmap scan data — Phase 5's final review flagged that most real `-sV`
+  probed matches cluster near 100.0, so revisit the bands before
+  leaning on this score for prioritization; Phase 6's exposed-service
+  checks and `SENSITIVE_PORTS` table are a first-pass curated list, not
+  exhaustive — expand it with real-world findings before leaning on it
+  for coverage claims; a TLS candidate port whose handshake fails for
+  any reason (unreachable, non-TLS listener) produces zero TLS findings,
+  indistinguishable from a port with no TLS-relevant issues at all — the
+  same "clean vs. failed, looks identical" ambiguity Phase 4 already
+  has for CVE correlation.
 - No CI configured yet. No GitHub remote existed until this was pushed
   manually — verify `git remote -v` / `.github/` before assuming any
   pipeline exists.
@@ -169,6 +220,35 @@ conventions below should track reality, not the plan that predates it.
   mechanisms independent even though they live on the same row. No
   bulk/batch validation endpoint, no audit log beyond `validated_at`, no
   automatic false-positive heuristics — deliberately out of scope.
+- **Misconfiguration analysis** (Phase 6): `analyzer.py` resolves the
+  TLS-candidate port set (`tls_inspector.TLS_CANDIDATE_PORTS` ∪ any
+  service whose `service_name` suggests TLS) **intersected with the
+  ports this scan's services actually have open** before calling
+  `inspect_tls` exactly once per scan (never once per service) — don't
+  regress into probing the full candidate set unconditionally, that was
+  a real wasted-traffic bug fixed in this phase's final review.
+  `check_headers`/`check_exposed_service`/`check_tls_result` are all
+  pure functions — never raise, never touch DB/Redis/network;
+  `analyzer.py` itself commits once per service inside that service's
+  own `try/except` (mirrors `correlator.py`'s per-CPE isolation) plus
+  an outer safety net, and never touches `scan.status` (it takes
+  `services`, not `scan`). The `uq_misconfig_service_check` unique
+  constraint on `(service_id, check_id)` is load-bearing; `analyzer.py`
+  has its own defensive dedup on top of it. `exposed_service_checks.py`
+  is a pure port→label table lookup — it never connects to verify
+  anything, preserving the no-banner-grabbing boundary. `tls_inspector.py`
+  is the only module in this phase allowed to open a network
+  connection — don't add a second ad hoc probe elsewhere. Its
+  `verify_mode=ssl.CERT_NONE`/`check_hostname=False` AND its lowered
+  `minimum_version`/permissive cipher policy are both deliberate, not
+  vulnerabilities to "fix": this project's TLS inspector sends no
+  credentials and treats every handshake as passive evidence only,
+  exactly like `http_prober.py`'s `verify=False` — refusing a legacy or
+  self-signed handshake would just hide the misconfiguration this
+  module exists to detect. `header_checks.py`'s `insecure-cookie` check
+  parses `Set-Cookie` by splitting on `;` and comparing exact trimmed
+  attribute names, never raw substring search (a cookie literally named
+  `secure_session=...` must not look like it has the `Secure` flag set).
 
 ## Running it
 
