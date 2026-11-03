@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.finding import FindingValidationState
 
@@ -37,4 +37,4 @@ class FindingValidationUpdate(BaseModel):
     """
 
     validation_state: FindingValidationState
-    validation_note: str | None = None
+    validation_note: str | None = Field(default=None, max_length=2000)

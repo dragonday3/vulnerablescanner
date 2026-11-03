@@ -23,10 +23,12 @@ export default function FindingValidationControl({ finding }: { finding: Finding
     setIsSubmitting(true);
     setError(null);
     try {
-      await updateFindingValidation(finding.id, {
+      const result = await updateFindingValidation(finding.id, {
         validation_state: state,
         validation_note: note.trim() === "" ? null : note.trim(),
       });
+      setState(result.validation_state);
+      setNote(result.validation_note ?? "");
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to update finding.");
@@ -49,9 +51,9 @@ export default function FindingValidationControl({ finding }: { finding: Finding
       </select>
       <input
         type="text"
-        value={note}
+        value={state === "unvalidated" ? "" : note}
         onChange={(event) => setNote(event.target.value)}
-        disabled={isSubmitting}
+        disabled={isSubmitting || state === "unvalidated"}
         placeholder="Note (optional)"
         className="w-32 rounded border border-zinc-300 px-1.5 py-0.5 text-xs text-zinc-700 disabled:opacity-60"
       />

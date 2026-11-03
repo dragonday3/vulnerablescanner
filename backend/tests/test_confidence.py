@@ -51,8 +51,8 @@ def test_compute_confidence_table(method: object, conf: object, expected: float)
 
 
 def test_compute_confidence_never_raises_for_weird_evidence_shapes() -> None:
-    """Defensive: a Service with no evidence at all, or a non-dict
-    evidence, must still produce a concrete float, never raise.
+    """Defensive: a Service with `evidence=None` or `evidence={}` (no
+    evidence at all) must still produce a concrete float, never raise.
     """
     assert confidence.compute_confidence(types.SimpleNamespace(evidence=None, id="x")) == 10.0
     assert confidence.compute_confidence(types.SimpleNamespace(evidence={}, id="x")) == 10.0
