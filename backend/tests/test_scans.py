@@ -406,6 +406,7 @@ def test_get_scan_assets_returns_nested_findings_for_correlated_service(
         cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
         description="Path traversal and file disclosure in Apache HTTP Server 2.4.49.",
         evidence={"id": "CVE-2021-41773", "sourceIdentifier": "nvd@nist.gov"},
+        confidence_score=100.0,
     )
     db.add(finding)
     db.commit()
@@ -436,6 +437,16 @@ def test_get_scan_assets_returns_nested_findings_for_correlated_service(
         "sourceIdentifier": "nvd@nist.gov",
     }
     assert "created_at" in finding_body
+    # Phase 5 additions: these are plain columns on the already-loaded
+    # Finding row, not a new relationship, so they round-trip through this
+    # existing endpoint with no eager-load change needed. This Finding was
+    # seeded directly (not through correlation), so it carries whatever
+    # confidence_score was explicitly set, and the validation fields show
+    # their untouched defaults.
+    assert finding_body["confidence_score"] == 100.0
+    assert finding_body["validation_state"] == "unvalidated"
+    assert finding_body["validation_note"] is None
+    assert finding_body["validated_at"] is None
 
     uncorrelated = services_by_port[22]
     assert uncorrelated["findings"] == []

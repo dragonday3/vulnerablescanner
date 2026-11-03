@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.api.routes.findings import router as findings_router
 from app.api.routes.health import router as health_router
 from app.api.routes.projects import router as projects_router
 from app.api.routes.scans import router as scans_router
@@ -90,3 +91,4 @@ app.include_router(health_router, prefix=settings.API_V1_PREFIX)
 app.include_router(projects_router, prefix=settings.API_V1_PREFIX)
 app.include_router(targets_router, prefix=settings.API_V1_PREFIX)
 app.include_router(scans_router, prefix=settings.API_V1_PREFIX)
+app.include_router(findings_router, prefix=settings.API_V1_PREFIX)

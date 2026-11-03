@@ -26,7 +26,7 @@ from app.models.project import Project
 from app.models.scan import Scan, ScanStatus
 from app.models.service import Service
 from app.models.target import Target, TargetType
-from app.modules.vulnerability import cache, nvd_client
+from app.modules.vulnerability import cache, confidence, nvd_client
 from app.modules.vulnerability.correlator import MAX_DISTINCT_CPES_PER_SCAN, correlate_services
 from app.modules.vulnerability.nvd_client import NvdFetchResult
 
@@ -382,3 +382,66 @@ def test_per_cpe_cache_store_integrity_error_skips_only_that_cpe(
     # Third CPE still processed normally.
     assert len(findings_3) == 1
     assert findings_3[0].cve_id == "CVE-0003-0001"
+
+
+def test_confidence_score_attached_per_service_sharing_one_cpe(
+    db: Session, redis_client: redis.Redis
+) -> None:
+    """Two Service rows sharing the SAME CPE but carrying different
+    method/conf evidence (PLAN_5.md section 3's explicitly-called-out
+    scenario) must each get their OWN, evidence-correct confidence_score
+    on every Finding row -- confidence must never be computed once for
+    the shared CPE and reused across both services.
+    """
+    service_probed = _make_service(
+        db, evidence={"cpe": [CPE22], "method": "probed", "conf": "10"}, port=80
+    )
+    service_table = _make_service(db, evidence={"cpe": [CPE22], "method": "table"}, port=443)
+
+    with patch.object(
+        nvd_client,
+        "fetch_cves_for_cpe",
+        return_value=_fetch_result("CVE-2021-41773", "CVE-2021-42013"),
+    ):
+        correlate_services(db, redis_client, [service_probed, service_table])
+
+    findings_probed = (
+        db.execute(select(Finding).where(Finding.service_id == service_probed.id)).scalars().all()
+    )
+    findings_table = (
+        db.execute(select(Finding).where(Finding.service_id == service_table.id)).scalars().all()
+    )
+
+    assert len(findings_probed) == 2
+    assert all(f.confidence_score == 100.0 for f in findings_probed)
+    assert len(findings_table) == 2
+    assert all(f.confidence_score == 20.0 for f in findings_table)
+
+
+def test_compute_confidence_called_once_per_service_not_once_per_finding(
+    db: Session, redis_client: redis.Redis
+) -> None:
+    """Locks in the "computed once per Service" design from PLAN_5.md
+    section 3: with one service whose CPE matches 3+ CVEs,
+    `compute_confidence` must be called exactly `len(mapped_services)`
+    times, never once per (service, cve) pair -- a regression into the
+    comprehension's inner loop would call it 3x here instead of once.
+    """
+    service = _make_service(db, evidence={"cpe": [CPE22], "method": "probed", "conf": "10"})
+
+    with (
+        patch.object(
+            nvd_client,
+            "fetch_cves_for_cpe",
+            return_value=_fetch_result("CVE-0001-0001", "CVE-0001-0002", "CVE-0001-0003"),
+        ),
+        patch.object(
+            confidence, "compute_confidence", wraps=confidence.compute_confidence
+        ) as mock_compute,
+    ):
+        correlate_services(db, redis_client, [service])
+
+    assert mock_compute.call_count == 1
+
+    findings = db.execute(select(Finding).where(Finding.service_id == service.id)).scalars().all()
+    assert len(findings) == 3
