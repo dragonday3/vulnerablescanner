@@ -237,6 +237,24 @@ export default async function ScanResultsPage({
                               ))}
                             </div>
                           )}
+                          {service.misconfigurations.length > 0 && (
+                            <div className="mt-2 flex flex-col gap-1">
+                              {service.misconfigurations.map((misconfig) => (
+                                <div
+                                  key={misconfig.id}
+                                  className="flex flex-wrap items-center gap-1.5"
+                                >
+                                  <SeverityBadge severity={misconfig.severity} />
+                                  <span className="text-xs text-zinc-700">
+                                    {misconfig.title}
+                                  </span>
+                                  <span className="text-xs text-zinc-500">
+                                    {misconfig.description}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
                         </td>
                       </tr>
                     ))}

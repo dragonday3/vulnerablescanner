@@ -4,6 +4,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict
 
 from app.schemas.finding import FindingRead
+from app.schemas.misconfiguration import MisconfigurationRead
 
 
 class ServiceRead(BaseModel):
@@ -22,3 +23,4 @@ class ServiceRead(BaseModel):
     evidence: dict | None
     created_at: datetime
     findings: list[FindingRead] = []
+    misconfigurations: list[MisconfigurationRead] = []

@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.models.asset import Asset
 from app.models.finding import Finding
+from app.models.misconfiguration import Misconfiguration
 from app.models.scan import Scan, ScanStatus
 from app.models.service import Service
 from app.models.target import Target
@@ -343,6 +344,9 @@ def test_get_scan_assets_returns_nested_assets_and_services_with_fingerprint_fie
     }
 
     assert fingerprinted["findings"] == []
+    # Phase 6: a present, empty list (never an omitted key or `null`) for a
+    # service with no Misconfiguration rows - same convention as `findings`.
+    assert fingerprinted["misconfigurations"] == []
 
     bare = services_by_port[22]
     assert bare["service_name"] == "ssh"
@@ -352,6 +356,7 @@ def test_get_scan_assets_returns_nested_assets_and_services_with_fingerprint_fie
     assert bare["fingerprint_source"] is None
     assert bare["evidence"] is None
     assert bare["findings"] == []
+    assert bare["misconfigurations"] == []
 
 
 def test_get_scan_assets_returns_nested_findings_for_correlated_service(
@@ -450,6 +455,80 @@ def test_get_scan_assets_returns_nested_findings_for_correlated_service(
 
     uncorrelated = services_by_port[22]
     assert uncorrelated["findings"] == []
+
+
+def test_get_scan_assets_returns_nested_misconfigurations_for_flagged_service(
+    client: TestClient, db: Session
+) -> None:
+    """Phase 6 Task 5's contract: `GET /scans/{id}/assets` nests
+    `misconfigurations` under the matching `Service`, with every
+    `MisconfigurationRead` field round-tripping real values through the
+    DB -> ORM -> Pydantic -> JSON pipeline, and a service with zero
+    `Misconfiguration` rows comes back with `"misconfigurations": []` - a
+    present, empty list, never an omitted key or `null`.
+    """
+    ctx = _create_authorized_target(client)
+    scan = _create_scan(client, ctx)
+
+    asset = Asset(
+        project_id=uuid.UUID(ctx["project"]["id"]),
+        target_id=uuid.UUID(ctx["target"]["id"]),
+        scan_id=uuid.UUID(scan["id"]),
+        host="10.0.0.10",
+    )
+    db.add(asset)
+    db.flush()
+
+    flagged_service = Service(
+        asset_id=asset.id,
+        port=80,
+        protocol="tcp",
+        state="open",
+        service_name="http",
+        fingerprint_source="http",
+    )
+    clean_service = Service(
+        asset_id=asset.id,
+        port=22,
+        protocol="tcp",
+        state="open",
+        service_name="ssh",
+    )
+    db.add_all([flagged_service, clean_service])
+    db.flush()
+
+    misconfiguration = Misconfiguration(
+        service_id=flagged_service.id,
+        check_id="missing-hsts",
+        title="Missing Strict-Transport-Security header",
+        severity="LOW",
+        description="This service does not send an HSTS header.",
+        evidence={"headers": {"server": "uvicorn"}},
+    )
+    db.add(misconfiguration)
+    db.commit()
+
+    resp = client.get(f"/api/v1/scans/{scan['id']}/assets")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    services_by_port = {s["port"]: s for s in body[0]["services"]}
+
+    flagged = services_by_port[80]
+    assert len(flagged["misconfigurations"]) == 1
+    misconfig_body = flagged["misconfigurations"][0]
+    assert misconfig_body["id"] == str(misconfiguration.id)
+    assert misconfig_body["service_id"] == str(flagged_service.id)
+    assert misconfig_body["check_id"] == "missing-hsts"
+    assert misconfig_body["title"] == "Missing Strict-Transport-Security header"
+    assert misconfig_body["severity"] == "LOW"
+    assert misconfig_body["description"] == "This service does not send an HSTS header."
+    assert misconfig_body["evidence"] == {"headers": {"server": "uvicorn"}}
+    assert "created_at" in misconfig_body
+
+    clean = services_by_port[22]
+    assert clean["misconfigurations"] == []
 
 
 def test_get_scan_assets_returns_404_for_nonexistent_scan(client: TestClient) -> None:
