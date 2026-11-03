@@ -3,6 +3,8 @@ import { notFound } from "next/navigation";
 import StatusBadge from "@/components/StatusBadge";
 import FingerprintBadge from "@/components/FingerprintBadge";
 import SeverityBadge from "@/components/SeverityBadge";
+import ValidationBadge from "@/components/ValidationBadge";
+import FindingValidationControl from "@/components/FindingValidationControl";
 import { getScan, getScanAssets } from "@/lib/api/scans";
 import { listTargets } from "@/lib/api/targets";
 import type { ScanRead } from "@/lib/types/scan";
@@ -202,14 +204,22 @@ export default async function ScanResultsPage({
                               {service.findings.map((finding) => (
                                 <div
                                   key={finding.id}
-                                  className="flex flex-wrap items-center gap-1.5"
+                                  className={`flex flex-wrap items-center gap-1.5 ${
+                                    finding.validation_state === "false_positive"
+                                      ? "opacity-50"
+                                      : ""
+                                  }`}
                                 >
                                   <SeverityBadge severity={finding.severity} />
                                   <a
                                     href={`https://nvd.nist.gov/vuln/detail/${finding.cve_id}`}
                                     target="_blank"
                                     rel="noopener noreferrer"
-                                    className="font-mono text-xs text-blue-600 hover:underline"
+                                    className={`font-mono text-xs text-blue-600 hover:underline ${
+                                      finding.validation_state === "false_positive"
+                                        ? "line-through"
+                                        : ""
+                                    }`}
                                   >
                                     {finding.cve_id}
                                   </a>
@@ -218,6 +228,11 @@ export default async function ScanResultsPage({
                                       (CVSS {finding.cvss_score})
                                     </span>
                                   )}
+                                  <span className="text-xs text-zinc-500">
+                                    Confidence: {Math.round(finding.confidence_score)}/100
+                                  </span>
+                                  <ValidationBadge state={finding.validation_state} />
+                                  <FindingValidationControl finding={finding} />
                                 </div>
                               ))}
                             </div>
