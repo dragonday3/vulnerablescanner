@@ -6,6 +6,7 @@
  */
 
 import type { FindingRead } from "./finding";
+import type { MisconfigurationRead } from "./misconfiguration";
 
 // The backend column is a plain nullable `String(20)`, but typing it as a
 // closed union here (rather than `string | null`) means adding a new
@@ -27,4 +28,5 @@ export interface ServiceRead {
   evidence: Record<string, unknown> | null;
   created_at: string;
   findings: FindingRead[];
+  misconfigurations: MisconfigurationRead[];
 }

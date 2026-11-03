@@ -24,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.asset import Asset
+from app.models.misconfiguration import Misconfiguration
 from app.models.project import Project
 from app.models.scan import Scan, ScanStatus
 from app.models.service import Service
@@ -727,3 +728,146 @@ def test_correlate_services_called_with_full_services_list_regardless_of_adapter
     call_args = mock_correlate.call_args.args
     passed_services = call_args[2]
     assert {s.port for s in passed_services} == {22, 80}
+
+
+# --- Phase 6: ANALYZING transition + analyze_services wiring ---
+#
+# `analyzer.analyze_services` itself is mocked at this level (not its
+# internals, which is test_analyzer.py's job) for the wiring tests below,
+# mirroring how Phase 4's CORRELATING tests above mock correlate_services
+# — purely about run_scan_task's orchestration, not check-family logic.
+# The final test in this section is the exception: it deliberately runs
+# the REAL analyze_services (including a real inspect_tls call against an
+# unreachable TLS candidate port) to prove the best-effort contract end
+# to end, not just assert it against a mock.
+
+
+@pytest.mark.parametrize("scanner_name", ["native", "nmap"])
+def test_analyzing_is_reached_as_an_intermediate_status(
+    db: Session,
+    use_test_session: None,
+    monkeypatch: pytest.MonkeyPatch,
+    scanner_name: str,
+) -> None:
+    """ANALYZING must actually be set (and committed) as an intermediate
+    state for both adapters, not skipped straight to CORRELATING/COMPLETED
+    — mirrors the FINGERPRINTING/CORRELATING tests above, same
+    spy-on-db.commit technique.
+    """
+    scan = _make_scan(db, value="127.0.0.1", config={"scanner": scanner_name})
+    fake_results = [PortScanResult(port=22, protocol="tcp", state="open")]
+
+    observed_statuses: list[ScanStatus] = []
+    original_commit = db.commit
+
+    def spy_commit() -> None:
+        observed_statuses.append(scan.status)
+        original_commit()
+
+    monkeypatch.setattr(db, "commit", spy_commit)
+
+    adapter_cls = NativePortScanner if scanner_name == "native" else NmapPortScanner
+    with (
+        patch.object(adapter_cls, "scan", return_value=fake_results),
+        patch.object(tasks_module, "analyze_services") as mock_analyze,
+    ):
+        tasks_module.run_scan_task(str(scan.id))
+
+    mock_analyze.assert_called_once()
+    assert ScanStatus.ANALYZING in observed_statuses
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.COMPLETED
+
+
+def test_analyze_services_failure_does_not_fail_scan(db: Session, use_test_session: None) -> None:
+    """The never-fail-the-scan contract, this stage's version: an
+    `analyze_services` exception must be caught, logged, and rolled
+    back — the scan still reaches COMPLETED with error_message still
+    None, mirroring the equivalent Phase 3/4 tests.
+    """
+    scan = _make_scan(db, value="127.0.0.1")
+    fake_results = [PortScanResult(port=80, protocol="tcp", state="open")]
+
+    with (
+        patch.object(NativePortScanner, "scan", return_value=fake_results),
+        patch.object(
+            tasks_module, "analyze_services", side_effect=RuntimeError("analysis boom")
+        ) as mock_analyze,
+    ):
+        tasks_module.run_scan_task(str(scan.id))
+
+    mock_analyze.assert_called_once()
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.COMPLETED
+    assert scan.completed_at is not None
+    assert scan.error_message is None
+
+
+@pytest.mark.parametrize("scanner_name", ["native", "nmap"])
+def test_analyze_services_called_with_full_services_list_regardless_of_adapter(
+    db: Session, use_test_session: None, scanner_name: str
+) -> None:
+    """No `scanner_name == "native"` guard at this call site (unlike Step
+    9's native-only guard): `analyze_services` must be invoked
+    unconditionally, with the FULL `services` list and the target's host
+    value, for both adapters.
+    """
+    scan = _make_scan(db, value="127.0.0.1", config={"scanner": scanner_name})
+    fake_results = [
+        PortScanResult(port=22, protocol="tcp", state="open"),
+        PortScanResult(port=80, protocol="tcp", state="open"),
+    ]
+
+    adapter_cls = NativePortScanner if scanner_name == "native" else NmapPortScanner
+    with (
+        patch.object(adapter_cls, "scan", return_value=fake_results),
+        patch.object(tasks_module, "analyze_services") as mock_analyze,
+    ):
+        tasks_module.run_scan_task(str(scan.id))
+
+    mock_analyze.assert_called_once()
+    call_args = mock_analyze.call_args.args
+    passed_services = call_args[1]
+    passed_host = call_args[2]
+    assert {s.port for s in passed_services} == {22, 80}
+    assert passed_host == "127.0.0.1"
+
+
+def test_unreachable_tls_candidate_port_still_reaches_completed(
+    db: Session, use_test_session: None
+) -> None:
+    """The core best-effort contract for this phase, exercised against
+    the REAL `analyze_services`/`inspect_tls` (not mocked) — a scan whose
+    only discovered port is a TLS candidate port (443) with nothing
+    actually listening there (a genuine connection-refused, not a
+    simulated failure) must still: (a) produce zero Misconfiguration
+    rows for the TLS check family (a candidate port with no real TLS
+    response is "no TLS candidates," not an error), and (b) reach
+    COMPLETED, never FAILED, proving the never-fail-the-scan contract
+    actually holds end to end, not just when analyze_services is mocked.
+    """
+    scan = _make_scan(db, value="127.0.0.1")
+    # Port 443 is a TLS_CANDIDATE_PORTS entry; nothing in this test
+    # environment listens there, so the real inspect_tls() call inside
+    # the real analyze_services() gets a genuine connection-refused.
+    fake_results = [PortScanResult(port=443, protocol="tcp", state="open")]
+
+    with patch.object(NativePortScanner, "scan", return_value=fake_results):
+        tasks_module.run_scan_task(str(scan.id))
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.COMPLETED
+    assert scan.completed_at is not None
+    assert scan.error_message is None
+
+    asset = db.execute(select(Asset).where(Asset.scan_id == scan.id)).scalar_one()
+    service = db.execute(select(Service).where(Service.asset_id == asset.id)).scalar_one()
+    misconfigs = (
+        db.execute(select(Misconfiguration).where(Misconfiguration.service_id == service.id))
+        .scalars()
+        .all()
+    )
+    tls_check_ids = {"self-signed-cert", "expired-cert", "expiring-soon-cert", "weak-tls-protocol"}
+    assert not any(m.check_id in tls_check_ids for m in misconfigs)

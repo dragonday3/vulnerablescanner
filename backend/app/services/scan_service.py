@@ -88,7 +88,10 @@ def get_scan_assets(db: Session, scan_id: uuid.UUID) -> list[Asset]:
     get_scan(db, scan_id)  # raises NotFoundError if the scan itself doesn't exist
     return (
         db.query(Asset)
-        .options(selectinload(Asset.services).selectinload(Service.findings))
+        .options(
+            selectinload(Asset.services).selectinload(Service.findings),
+            selectinload(Asset.services).selectinload(Service.misconfigurations),
+        )
         .filter(Asset.scan_id == scan_id)
         .order_by(Asset.created_at)
         .all()
