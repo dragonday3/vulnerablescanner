@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, ForeignKey, String, func
+from sqlalchemy import DateTime, Float, ForeignKey, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base_class import Base
@@ -25,6 +25,17 @@ class Asset(Base):
     )
     host: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # --- Phase 7 additions ---
+    # NULL means "not yet risk-scored" (pre-Phase-7 row, or this scan
+    # hasn't reached RISK_ANALYSIS yet) -- a real, distinct state from a
+    # computed score of 0.0/tier "NONE" ("scored, nothing found"). See
+    # PLAN_7.md's architecture-decision #3 for why this is nullable where
+    # Finding.confidence_score is not.
+    risk_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # CRITICAL/HIGH/MEDIUM/LOW/NONE -- same vocabulary and same
+    # plain-string-not-enum convention as Finding.severity/
+    # Misconfiguration.severity.
+    risk_tier: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     # order_by="Service.port": without it, services come back in arbitrary
     # (heap) order, and since the native-enrichment pass UPDATEs rows in
