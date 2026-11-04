@@ -102,9 +102,57 @@ conventions below should track reality, not the plan that predates it.
   only by testing against a real TLS listener, not by any mocked unit
   test (the same "mocks hide the live shape" lesson as the NVD-client
   bugs below). See `PLAN_6.md` / `PLAN_6_TASKS.md`.
-- **Phase 7+** (risk scoring, reporting) — not started. Placeholder
-  empty packages already exist under `backend/app/modules/` for each.
-  Known, deliberately deferred gaps for whichever phase picks them up:
+- **Phase 7** (Risk Intelligence / VRPS scoring) — done, merged to
+  `main`. A persisted continuous 0-100 `risk_score` + `CRITICAL`/
+  `HIGH`/`MEDIUM`/`LOW`/`NONE` `risk_tier` on both `Asset` and `Scan`
+  (`backend/app/models/asset.py`/`scan.py`, both nullable, no backfill
+  — `NULL` means "not yet scored", a real, distinct state from a
+  computed `0.0`/`"NONE"` meaning "scored, nothing found"), computed
+  once per scan in `ScanStatus.RISK_ANALYSIS`, reserved-but-unused since
+  Phase 1, now wired up in `tasks.py` between `CORRELATING` and
+  `COMPLETED` (`REPORT_GENERATION` itself still isn't wired up — Phase
+  8's job, so this stage currently falls straight through to
+  `COMPLETED`, same as `ANALYZING` did before Phase 6). The score
+  combines three earlier phases' evidence: Phase 4's
+  `Finding.severity`/`cvss_score`, Phase 5's
+  `Finding.confidence_score`/`validation_state` (a `FALSE_POSITIVE`
+  finding contributes exactly `0.0`, per `PLAN_5.md`'s own stated
+  expectation for this phase), and Phase 6's `Misconfiguration.severity`
+  (flat severity weight, relatively discounted against a matched-CVE
+  finding's own weight — no confidence/validation signal exists for a
+  `Misconfiguration` row). New `backend/app/modules/risk/` package:
+  `scoring_config.py` (every tunable number named in one file) and
+  `scoring.py` (four pure functions, the one of note being
+  `aggregate_risk`'s noisy-OR combination — treats each 0-100
+  contribution as an independent "this alone makes it risky"
+  probability, so one near-100 contribution dominates and many small
+  ones add up without a plain sum blowing past 100). The orchestrator,
+  `risk_scorer.py`'s `score_assets(db, scan, assets)`, scores each
+  `Asset` in its own try/except (mirrors `correlator.py`/`analyzer.py`'s
+  per-unit isolation), then aggregates the *successfully-scored* assets'
+  own `risk_score` values into one `Scan`-level score — and, unlike
+  those two modules, its signature deliberately takes `scan`, not just
+  `assets`, because writing `scan.risk_score`/`risk_tier` is its job;
+  the inherited rule from Phase 4/6 is "never mutate `scan.status`," not
+  "never touch `scan` at all," and this module never does the former.
+  **Zero new network/Redis surface** — purely a DB-read + pure-function
+  + DB-write stage, unlike Phase 4's NVD client or Phase 6's TLS
+  inspector. The final whole-branch review caught a real bug here: if
+  every asset's scoring failed (today, with exactly one `Asset` per
+  scan, the *only* way this stage can fail at all), the scan-level
+  aggregate was computed over an empty list, silently committing
+  `0.0`/`"NONE"` — indistinguishable from a genuinely clean scan. Fixed
+  before merge: an all-failed scan now leaves `scan.risk_score`/
+  `risk_tier` untouched (stays `NULL`), while a genuinely empty `assets`
+  list still legitimately scores `0.0`/`"NONE"`. Surfaced read-only via
+  the existing `GET /scans/{id}` and `GET /scans/{id}/assets` endpoints
+  and two new badge render points on the scan results page, reusing the
+  existing `Severity` type/`SeverityBadge` component unchanged — the
+  same reuse Phase 6 already did for `Misconfiguration`. See
+  `PLAN_7.md` / `PLAN_7_TASKS.md`.
+- **Phase 8+** (reporting) — not started. A placeholder empty package
+  already exists under `backend/app/modules/` for it. Known,
+  deliberately deferred gaps for whichever phase picks them up:
   CVSS v4 (`cvssMetricV40`) isn't read, so a V4-only-scored CVE shows
   severity `NONE`; a scan with zero findings looks identical whether
   that's a genuinely clean result or a correlation failure (NVD outage,
@@ -120,7 +168,28 @@ conventions below should track reality, not the plan that predates it.
   any reason (unreachable, non-TLS listener) produces zero TLS findings,
   indistinguishable from a port with no TLS-relevant issues at all — the
   same "clean vs. failed, looks identical" ambiguity Phase 4 already
-  has for CVE correlation.
+  has for CVE correlation; Phase 7's `RISK_TIER_BANDS` and
+  `MISCONFIG_RELATIVE_WEIGHT` constants (`scoring_config.py`) are
+  likewise a first-pass judgment call — a real end-to-end verification
+  scan with 85 findings saturated to `100.0`/`CRITICAL` and barely
+  moved even after excluding a false positive, concretely confirming
+  the same "clustered near the ceiling" pattern `confidence_score`
+  already shows, before leaning on this score for cross-scan/
+  multi-asset prioritization (candidate remedies: a per-asset top-N or
+  max-plus-diminishing-tail aggregation instead of plain noisy-OR, or
+  de-duplicating by CVE before scoring — today the same CVE can
+  contribute two independent noisy-OR terms to one asset via two CPEs
+  on one service, or the same CVE on two services, which pushes
+  saturation further); and `risk_score`/`risk_tier` are a snapshot
+  taken once during `RISK_ANALYSIS` — confirming or invalidating a
+  `Finding` via `PATCH /findings/{id}` after a scan completes does
+  **not** re-trigger scoring, so that scan's risk score goes stale
+  until its next run (deliberate, not a bug — see `PLAN_7.md`'s Scope
+  limits). Also note: today there is only ever one `Asset` per scan
+  (see Conventions below), so the per-Asset and per-Scan risk scores
+  are currently numerically identical in every real scan — this only
+  becomes meaningfully different once a future CIDR-scanning phase
+  makes multi-asset scans real.
 - No CI configured yet. No GitHub remote existed until this was pushed
   manually — verify `git remote -v` / `.github/` before assuming any
   pipeline exists.
@@ -249,6 +318,32 @@ conventions below should track reality, not the plan that predates it.
   parses `Set-Cookie` by splitting on `;` and comparing exact trimmed
   attribute names, never raw substring search (a cookie literally named
   `secure_session=...` must not look like it has the `Secure` flag set).
+- **Risk scoring** (Phase 7): `scoring.py`'s four functions are pure —
+  no DB/Redis/network, every branch returns a concrete float/string,
+  never raises. `score_finding_contribution` excludes `FALSE_POSITIVE`
+  findings entirely (contributes `0.0`) and otherwise weights
+  `cvss_score` (scaled to 0-100) or, when absent, a severity-fallback
+  table, discounted by `confidence_score` — `CONFIRMED` gets no extra
+  boost over `UNVALIDATED` beyond the exclusion rule, keeping scoring
+  and validation independent even though both read `Finding`, same
+  discipline Phase 5 already established.
+  `score_misconfiguration_contribution` has no confidence/validation
+  signal to read (Phase 6 never added one) — flat severity weight,
+  relatively discounted. `aggregate_risk` is reused at two different
+  levels: once per-`Asset` over its services' findings/misconfigs, and
+  once per-`Scan` over its assets' own already-persisted `risk_score`
+  values — never recompute the scan aggregate from raw findings
+  directly. `risk_scorer.py`'s `score_assets` commits once per asset
+  inside that asset's own try/except (mirrors
+  `correlator.py`/`analyzer.py`), then a second, separate try/except
+  for the scan-level aggregate — that second step must exclude a failed
+  asset's score from the aggregate input entirely, never contribute it
+  as `0.0` (the bug the final review caught and fixed — see Status
+  above). All scoring constants live in `scoring_config.py`, nowhere
+  else — no magic numbers inline in `scoring.py`/`risk_scorer.py`. No
+  config table/override API this phase — same "hardcoded-but-named,
+  flagged here as first-pass" precedent as `confidence_score`'s bands
+  and Phase 6's `SENSITIVE_PORTS`.
 
 ## Running it
 
