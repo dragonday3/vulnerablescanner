@@ -3,9 +3,9 @@
 Evidence-Based Vulnerability Assessment & Risk Prioritization Platform.
 Authorized-use-only network scanner: projects contain targets (ip/cidr/
 domain/hostname), targets require `authorization_confirmed` before any
-scan can run against them, scans discover open services and (in later
-phases) will fingerprint, check misconfigurations, assess vulnerabilities,
-score risk, and report.
+scan can run against them, and scans discover open services,
+fingerprint them, check misconfigurations, correlate CVEs, score risk,
+and generate a report — the full pipeline (Phases 0-8) is complete.
 
 **Keep this file updated** as phases land — status, structure, and
 conventions below should track reality, not the plan that predates it.
@@ -150,46 +150,101 @@ conventions below should track reality, not the plan that predates it.
   existing `Severity` type/`SeverityBadge` component unchanged — the
   same reuse Phase 6 already did for `Misconfiguration`. See
   `PLAN_7.md` / `PLAN_7_TASKS.md`.
-- **Phase 8+** (reporting) — not started. A placeholder empty package
-  already exists under `backend/app/modules/` for it. Known,
-  deliberately deferred gaps for whichever phase picks them up:
-  CVSS v4 (`cvssMetricV40`) isn't read, so a V4-only-scored CVE shows
-  severity `NONE`; a scan with zero findings looks identical whether
-  that's a genuinely clean result or a correlation failure (NVD outage,
-  rate-limit timeout) — no per-scan outcome tracking yet;
-  `confidence_score`'s band constants (`PROBED_FLOOR`/`TABLE_CEILING`/
-  etc.) are a first-pass judgment call, not tuned against real-world
-  nmap scan data — Phase 5's final review flagged that most real `-sV`
-  probed matches cluster near 100.0, so revisit the bands before
-  leaning on this score for prioritization; Phase 6's exposed-service
-  checks and `SENSITIVE_PORTS` table are a first-pass curated list, not
-  exhaustive — expand it with real-world findings before leaning on it
-  for coverage claims; a TLS candidate port whose handshake fails for
-  any reason (unreachable, non-TLS listener) produces zero TLS findings,
-  indistinguishable from a port with no TLS-relevant issues at all — the
-  same "clean vs. failed, looks identical" ambiguity Phase 4 already
-  has for CVE correlation; Phase 7's `RISK_TIER_BANDS` and
-  `MISCONFIG_RELATIVE_WEIGHT` constants (`scoring_config.py`) are
-  likewise a first-pass judgment call — a real end-to-end verification
-  scan with 85 findings saturated to `100.0`/`CRITICAL` and barely
-  moved even after excluding a false positive, concretely confirming
-  the same "clustered near the ceiling" pattern `confidence_score`
-  already shows, before leaning on this score for cross-scan/
-  multi-asset prioritization (candidate remedies: a per-asset top-N or
-  max-plus-diminishing-tail aggregation instead of plain noisy-OR, or
-  de-duplicating by CVE before scoring — today the same CVE can
-  contribute two independent noisy-OR terms to one asset via two CPEs
-  on one service, or the same CVE on two services, which pushes
-  saturation further); and `risk_score`/`risk_tier` are a snapshot
-  taken once during `RISK_ANALYSIS` — confirming or invalidating a
+- **Phase 8** (Reporting) — done, merged to `main`. A new `Report` model
+  (`backend/app/models/report.py` — one per `Scan`, `scan_id` unique
+  indexed, `ON DELETE CASCADE`, a single JSONB `summary` column) is
+  generated once in `ScanStatus.REPORT_GENERATION`, reserved-but-unused
+  since Phase 1, now wired up in `tasks.py` immediately after
+  `RISK_ANALYSIS` — **this was the last reserved slot in the enum**;
+  every `ScanStatus` value now maps to real behavior somewhere in
+  `tasks.py`/`scan_service.py`. A pure function,
+  `backend/app/modules/reporting/report_builder.py`'s
+  `build_report_summary(scan, assets)`, assembles the full document
+  (target, the scan's own `risk_score`/`risk_tier`, findings/
+  misconfigurations counts by severity and — for findings —
+  `validation_state`, and a full per-asset → per-service breakdown of
+  every finding/misconfiguration's structured fields) purely from
+  already-persisted data, **deliberately excluding every raw `evidence`
+  JSONB blob** — a report is a readable summary, not a second copy of
+  raw evidence (still reachable via `GET /scans/{id}/assets`). The
+  orchestrator, `report_generator.py`'s `generate_report(db, scan,
+  assets)`, persists exactly one `Report` row per scan in a single
+  try/except (not a per-asset loop — there's only one document to
+  write for the whole scan), never touches `scan.status` (same
+  inherited rule as `correlator.py`/`analyzer.py`/`risk_scorer.py`),
+  and never raises past itself — report-generation failures can never
+  flip a scan to `FAILED`, same best-effort contract as every stage
+  since `FINGERPRINTING`. **Zero new network/Redis surface, zero new
+  runtime dependency** — no PDF-generation library; "exportable" is
+  satisfied by `GET /scans/{id}/report`'s JSON response itself plus a
+  new print-formatted frontend page
+  (`/projects/[projectId]/scans/[scanId]/report`, linked from the
+  existing results page once `scan.status === "completed"`) exported
+  via the browser's own print-to-PDF, using Tailwind `print:hidden` to
+  drop navigation/buttons from the printed view. `GET /scans/{id}/report`
+  returns 404 via two textually distinct `NotFoundError` messages — one
+  for "the scan itself doesn't exist", a separate one for "the scan
+  exists but hasn't reached `REPORT_GENERATION` yet" — a deliberately
+  different null-handling shape than Phase 7's nullable columns, since
+  a `Report` is its own resource that may simply not exist yet, not a
+  field on an always-present row. **A report, like `risk_score`, is a
+  point-in-time snapshot, never regenerated**: a `PATCH /findings/{id}`
+  validation-state change after `REPORT_GENERATION` does not
+  retroactively update an already-generated report (verified live in
+  this phase's own full-stack check). The final whole-branch review
+  caught a real cross-task bug no individual task review could see:
+  the report summary doesn't carry a `Finding`'s `matched_cpe`/`id`, so
+  the frontend's findings list keyed on `cve_id` alone — which can
+  collide, since the same CVE can legitimately match one service
+  through two different CPEs (see the Phase 7 double-counting gap
+  below, same root cause). Fixed before merge by keying on
+  `${cve_id}-${index}` instead. See `PLAN_8.md` / `PLAN_8_TASKS.md`.
+- **Known, deliberately deferred gaps**, for whichever future work
+  picks them up (no further phase is currently planned — Phase 8 was
+  the last item on the original roadmap): CVSS v4 (`cvssMetricV40`)
+  isn't read, so a V4-only-scored CVE shows severity `NONE`; a scan
+  with zero findings looks identical whether that's a genuinely clean
+  result or a correlation failure (NVD outage, rate-limit timeout) — no
+  per-scan outcome tracking yet; `confidence_score`'s band constants
+  (`PROBED_FLOOR`/`TABLE_CEILING`/etc.) are a first-pass judgment call,
+  not tuned against real-world nmap scan data — Phase 5's final review
+  flagged that most real `-sV` probed matches cluster near 100.0, so
+  revisit the bands before leaning on this score for prioritization;
+  Phase 6's exposed-service checks and `SENSITIVE_PORTS` table are a
+  first-pass curated list, not exhaustive — expand it with real-world
+  findings before leaning on it for coverage claims; a TLS candidate
+  port whose handshake fails for any reason (unreachable, non-TLS
+  listener) produces zero TLS findings, indistinguishable from a port
+  with no TLS-relevant issues at all — the same "clean vs. failed,
+  looks identical" ambiguity Phase 4 already has for CVE correlation;
+  Phase 7's `RISK_TIER_BANDS` and `MISCONFIG_RELATIVE_WEIGHT` constants
+  (`scoring_config.py`) are likewise a first-pass judgment call — a
+  real end-to-end verification scan with 85 findings saturated to
+  `100.0`/`CRITICAL` and barely moved even after excluding a false
+  positive, concretely confirming the same "clustered near the
+  ceiling" pattern `confidence_score` already shows, before leaning on
+  this score for cross-scan/multi-asset prioritization (candidate
+  remedies: a per-asset top-N or max-plus-diminishing-tail aggregation
+  instead of plain noisy-OR, or de-duplicating by CVE before scoring —
+  today the same CVE can contribute two independent noisy-OR terms to
+  one asset via two CPEs on one service, or the same CVE on two
+  services, which pushes saturation further **and, as of Phase 8, also
+  double-counts in the report's findings-by-severity/by-validation-state
+  totals the same way**); `risk_score`/`risk_tier` and, as of Phase 8,
+  the generated `Report` itself are both snapshots taken once during
+  their respective pipeline stages — confirming or invalidating a
   `Finding` via `PATCH /findings/{id}` after a scan completes does
-  **not** re-trigger scoring, so that scan's risk score goes stale
-  until its next run (deliberate, not a bug — see `PLAN_7.md`'s Scope
-  limits). Also note: today there is only ever one `Asset` per scan
-  (see Conventions below), so the per-Asset and per-Scan risk scores
-  are currently numerically identical in every real scan — this only
-  becomes meaningfully different once a future CIDR-scanning phase
-  makes multi-asset scans real.
+  **not** re-trigger either (deliberate, not a bug — see `PLAN_7.md`'s
+  and `PLAN_8.md`'s Scope limits); a completed scan whose own
+  `REPORT_GENERATION` step failed (or any pre-Phase-8 completed scan)
+  still shows the results page's "View report" link, which 404s on
+  click with no inline explanation — the plan's "guaranteed to exist
+  at `completed`" framing has this one edge case; and today there is
+  only ever one `Asset` per scan (see Conventions below), so the
+  per-Asset and per-Scan risk scores — and the report's per-asset
+  breakdown — are currently trivial in every real scan, only becoming
+  meaningfully different once a future CIDR-scanning phase makes
+  multi-asset scans real.
 - No CI configured yet. No GitHub remote existed until this was pushed
   manually — verify `git remote -v` / `.github/` before assuming any
   pipeline exists.
@@ -344,6 +399,36 @@ conventions below should track reality, not the plan that predates it.
   config table/override API this phase — same "hardcoded-but-named,
   flagged here as first-pass" precedent as `confidence_score`'s bands
   and Phase 6's `SENSITIVE_PORTS`.
+- **Reporting** (Phase 8): `report_builder.py`'s `build_report_summary`
+  is a pure function — no DB/Redis/network, every branch produces a
+  concrete value, never raises on well-formed input. It never copies a
+  raw `evidence` JSONB blob into the output; only the named structured
+  fields belong in a report (see Status above for the exact list) —
+  don't "helpfully" add more without updating this rule. `Report.summary`
+  is a passthrough JSONB `dict` on the backend, same convention as
+  `Finding.evidence`/`Service.evidence`/`Misconfiguration.evidence` —
+  not a strict nested Pydantic model; the frontend's `ReportSummary` TS
+  interface (`frontend/src/lib/types/report.ts`) is a hand-maintained
+  mirror of `report_builder.py`'s actual output shape, not independently
+  enforced by either side — a backend-side shape change must be
+  mirrored there by hand, in the same change. `report_generator.py`'s
+  `generate_report` writes exactly one `Report` row per scan in a
+  single try/except (never a per-asset loop — mirrors
+  `risk_scorer.py`'s per-unit isolation discipline at the granularity
+  of "one document," not "one asset"), and never touches `scan.status`.
+  The `reports` table's unique index on `scan_id` is load-bearing — it
+  is the actual mechanism enforcing "exactly one Report per Scan," not
+  just an application-level convention; don't rely on call-site
+  discipline alone. No report regeneration/versioning, no PATCH/POST
+  route for reports — a generated report is a fixed, one-time snapshot,
+  same precedent as `risk_score`'s own staleness contract. When
+  rendering a findings list anywhere derived from a `Report.summary`
+  (as opposed to a live `FindingRead` with a real `id`), never key a
+  list render on `cve_id` alone — the same CVE can legitimately appear
+  twice for one service via two different CPEs; key on `cve_id` plus
+  the array index (or carry a real discriminator into the summary
+  shape) instead. This was a real bug the final review caught, not a
+  hypothetical.
 
 ## Running it
 
