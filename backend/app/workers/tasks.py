@@ -17,6 +17,7 @@ from app.modules.discovery.native_scanner import NativePortScanner
 from app.modules.discovery.nmap_scanner import NmapPortScanner
 from app.modules.fingerprinting.http_prober import WEB_PORTS, probe_services
 from app.modules.misconfiguration.analyzer import analyze_services
+from app.modules.reporting.report_generator import generate_report
 from app.modules.risk.risk_scorer import score_assets
 from app.modules.vulnerability.correlator import correlate_services
 from app.workers.celery_app import celery_app
@@ -318,6 +319,23 @@ def run_scan_task(scan_id: str) -> None:
         except Exception:
             db.rollback()
             logger.exception("run_scan_task: scan %s risk scoring failed", scan_id)
+
+        # Step 10.6 (Phase 8): REPORT_GENERATION. Same best-effort shape as
+        # every prior post-discovery stage: report-generation failures must
+        # never fail the scan, so any exception here is logged and
+        # swallowed -- no scan.status mutation, no return, always falls
+        # through to COMPLETED below. This is the last slot the ScanStatus
+        # enum reserved -- after this stage, every enum value is wired to
+        # real behavior. `asset` is the same single Asset ORM object
+        # already in scope from Steps 5-7, reused exactly as
+        # score_assets(db, scan, [asset]) already is one stage earlier.
+        scan.status = ScanStatus.REPORT_GENERATION
+        db.commit()
+        try:
+            generate_report(db, scan, [asset])
+        except Exception:
+            db.rollback()
+            logger.exception("run_scan_task: scan %s report generation failed", scan_id)
 
         # Step 11: unchanged (was Step 10).
         scan.status = ScanStatus.COMPLETED
