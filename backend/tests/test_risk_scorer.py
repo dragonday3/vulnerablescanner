@@ -160,6 +160,46 @@ def test_per_asset_isolation_one_failure_does_not_abort_the_rest(db: Session) ->
     assert scan.risk_tier == "CRITICAL"
 
 
+def test_all_assets_failing_leaves_scan_risk_score_null_not_zero(db: Session) -> None:
+    """One scan, exactly one Asset, and that asset's own scoring raises --
+    today's only way for step 1 to end with zero successfully-scored
+    assets. `scored_asset_scores` is then empty, but it must NOT be
+    passed into `aggregate_risk`/`tier_for_score` and committed onto
+    `scan.risk_score`/`risk_tier` as 0.0/"NONE": that would be
+    indistinguishable from a genuinely clean scan (CLAUDE.md's Global
+    Constraint 6). The scan-level columns must stay exactly as they were
+    before this call -- NULL, since this scan was never scored.
+    """
+    scan = _make_scan(db)
+    asset = _make_asset(db, scan)
+    service = _add_service(db, asset, port=443)
+    _add_finding(db, service, cvss_score=9.0, confidence_score=100.0)
+
+    assert scan.risk_score is None
+    assert scan.risk_tier is None
+
+    with patch.object(
+        risk_scorer,
+        "score_finding_contribution",
+        side_effect=RuntimeError("boom: simulated scoring failure for the only asset"),
+    ):
+        score_assets(db, scan, [asset])
+
+    db.refresh(asset)
+    db.refresh(scan)
+
+    # The one asset's scoring raised -- left exactly as it was (never
+    # scored), not coerced to 0.0/"NONE".
+    assert asset.risk_score is None
+    assert asset.risk_tier is None
+
+    # The scan-level aggregate must likewise be left untouched -- NOT
+    # computed as aggregate_risk([]) == 0.0 / tier_for_score(0.0) ==
+    # "NONE", which would look identical to a genuinely clean scan.
+    assert scan.risk_score is None
+    assert scan.risk_tier is None
+
+
 # ---------------------------------------------------------------------------
 # Scan-level aggregate is computed from assets' own persisted risk_score
 # values, not recomputed from raw findings/misconfigs.

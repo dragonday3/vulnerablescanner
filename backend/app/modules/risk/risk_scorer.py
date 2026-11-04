@@ -56,7 +56,12 @@ def score_assets(db: Session, scan: Scan, assets: list[Asset]) -> None:
     (a failed asset contributes nothing to the scan-level aggregate -- the
     same "a failed unit looks like a clean one" ambiguity class CLAUDE.md
     already documents for correlation/analysis failures) onto
-    `scan.risk_score`/`risk_tier`, committed once.
+    `scan.risk_score`/`risk_tier`, committed once. If `assets` was
+    non-empty but every single one failed in step 1 -- leaving nothing
+    successfully scored to aggregate -- `scan.risk_score`/`risk_tier` are
+    left untouched (not coerced to 0.0/"NONE", which would be
+    indistinguishable from a genuinely clean scan) and a warning is
+    logged instead.
     """
     scored_asset_scores: list[float] = []
 
@@ -85,6 +90,20 @@ def score_assets(db: Session, scan: Scan, assets: list[Asset]) -> None:
                 asset.id,
             )
             continue
+
+    if assets and not scored_asset_scores:
+        # Every asset's scoring failed in step 1 above -- there is nothing
+        # legitimate to aggregate. Committing aggregate_risk([]) here would
+        # produce 0.0/"NONE", indistinguishable from "scored, genuinely
+        # nothing found" (the exact ambiguity CLAUDE.md's Global Constraint
+        # 6 forbids). Leave scan.risk_score/risk_tier exactly as they were
+        # (NULL if never scored) and let the caller/next run retry.
+        logger.warning(
+            "score_assets: every asset failed scoring for scan %s, leaving scan-level "
+            "risk_score/risk_tier untouched this run",
+            scan.id,
+        )
+        return
 
     try:
         scan.risk_score = aggregate_risk(scored_asset_scores)
