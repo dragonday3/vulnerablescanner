@@ -17,6 +17,7 @@ from app.modules.discovery.native_scanner import NativePortScanner
 from app.modules.discovery.nmap_scanner import NmapPortScanner
 from app.modules.fingerprinting.http_prober import WEB_PORTS, probe_services
 from app.modules.misconfiguration.analyzer import analyze_services
+from app.modules.reporting.report_generator import generate_report
 from app.modules.risk.risk_scorer import score_assets
 from app.modules.vulnerability.correlator import correlate_services
 from app.workers.celery_app import celery_app
@@ -282,7 +283,7 @@ def run_scan_task(scan_id: str) -> None:
         # shape as Step 9's: fingerprinting/correlation failures must never
         # fail the scan, so any exception here is logged and swallowed - no
         # scan.status mutation, no return, always falls through to
-        # COMPLETED below. Unlike Step 9's native-only guard, this runs for
+        # RISK_ANALYSIS below. Unlike Step 9's native-only guard, this runs for
         # BOTH adapters uniformly: only nmap-adapter Service rows will ever
         # actually have evidence["cpe"], but correlate_services's own
         # filtering (not a scanner_name check here) is what decides that -
@@ -302,15 +303,14 @@ def run_scan_task(scan_id: str) -> None:
         # Step 10.5 (Phase 7): RISK_ANALYSIS. Same best-effort shape as Steps
         # 9/9.5/10: scoring failures must never fail the scan, so any
         # exception here is logged and swallowed -- no scan.status
-        # mutation, no return, always falls through to COMPLETED below.
-        # Sits in the slot the ScanStatus enum already reserved between
-        # CORRELATING and REPORT_GENERATION; REPORT_GENERATION itself isn't
-        # wired up yet (Phase 8), so this stage currently falls straight
-        # through to COMPLETED, same as ANALYZING fell straight through to
-        # CORRELATING before Phase 6 existed. `asset` is the single Asset
-        # ORM object already built in Steps 5-7 above (one Asset per
-        # non-CIDR scan today); passed as a one-element list for signature
-        # symmetry with correlate_services/analyze_services.
+        # mutation, no return, always falls through to REPORT_GENERATION
+        # below. Sits in the slot the ScanStatus enum already reserved
+        # between CORRELATING and REPORT_GENERATION, now wired up by Phase
+        # 8 immediately after this stage, same as ANALYZING fell straight
+        # through to CORRELATING before Phase 6 existed. `asset` is the
+        # single Asset ORM object already built in Steps 5-7 above (one
+        # Asset per non-CIDR scan today); passed as a one-element list for
+        # signature symmetry with correlate_services/analyze_services.
         scan.status = ScanStatus.RISK_ANALYSIS
         db.commit()
         try:
@@ -318,6 +318,23 @@ def run_scan_task(scan_id: str) -> None:
         except Exception:
             db.rollback()
             logger.exception("run_scan_task: scan %s risk scoring failed", scan_id)
+
+        # Step 10.6 (Phase 8): REPORT_GENERATION. Same best-effort shape as
+        # every prior post-discovery stage: report-generation failures must
+        # never fail the scan, so any exception here is logged and
+        # swallowed -- no scan.status mutation, no return, always falls
+        # through to COMPLETED below. This is the last slot the ScanStatus
+        # enum reserved -- after this stage, every enum value is wired to
+        # real behavior. `asset` is the same single Asset ORM object
+        # already in scope from Steps 5-7, reused exactly as
+        # score_assets(db, scan, [asset]) already is one stage earlier.
+        scan.status = ScanStatus.REPORT_GENERATION
+        db.commit()
+        try:
+            generate_report(db, scan, [asset])
+        except Exception:
+            db.rollback()
+            logger.exception("run_scan_task: scan %s report generation failed", scan_id)
 
         # Step 11: unchanged (was Step 10).
         scan.status = ScanStatus.COMPLETED

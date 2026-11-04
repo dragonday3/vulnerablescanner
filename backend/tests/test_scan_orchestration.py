@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from app.models.asset import Asset
 from app.models.misconfiguration import Misconfiguration
 from app.models.project import Project
+from app.models.report import Report
 from app.models.scan import Scan, ScanStatus
 from app.models.service import Service
 from app.models.target import Target, TargetType
@@ -1000,3 +1001,130 @@ def test_full_run_populates_risk_score_and_tier_on_scan_and_asset(
     asset = db.execute(select(Asset).where(Asset.scan_id == scan.id)).scalar_one()
     assert asset.risk_score == 0.0
     assert asset.risk_tier == "NONE"
+
+
+# --- Phase 8: REPORT_GENERATION transition + generate_report wiring ---
+#
+# `report_generator.generate_report` itself is mocked at the wiring-test
+# level (not its internals, which is test_report_generator.py's job),
+# mirroring how the RISK_ANALYSIS/ANALYZING/CORRELATING sections above mock
+# score_assets/analyze_services/correlate_services. The final test in this
+# section runs the REAL generate_report end to end to prove exactly one
+# Report row lands after a full run.
+
+
+@pytest.mark.parametrize("scanner_name", ["native", "nmap"])
+def test_report_generation_is_reached_as_an_intermediate_status(
+    db: Session,
+    use_test_session: None,
+    monkeypatch: pytest.MonkeyPatch,
+    scanner_name: str,
+) -> None:
+    """REPORT_GENERATION must actually be set (and committed) as an
+    intermediate state for both adapters, not skipped straight to
+    COMPLETED — mirrors the FINGERPRINTING/CORRELATING/ANALYZING/
+    RISK_ANALYSIS tests above, same spy-on-db.commit technique.
+    """
+    scan = _make_scan(db, value="127.0.0.1", config={"scanner": scanner_name})
+    fake_results = [PortScanResult(port=22, protocol="tcp", state="open")]
+
+    observed_statuses: list[ScanStatus] = []
+    original_commit = db.commit
+
+    def spy_commit() -> None:
+        observed_statuses.append(scan.status)
+        original_commit()
+
+    monkeypatch.setattr(db, "commit", spy_commit)
+
+    adapter_cls = NativePortScanner if scanner_name == "native" else NmapPortScanner
+    with (
+        patch.object(adapter_cls, "scan", return_value=fake_results),
+        patch.object(tasks_module, "generate_report") as mock_generate_report,
+    ):
+        tasks_module.run_scan_task(str(scan.id))
+
+    mock_generate_report.assert_called_once()
+    assert ScanStatus.REPORT_GENERATION in observed_statuses
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.COMPLETED
+
+
+def test_generate_report_failure_does_not_fail_scan(db: Session, use_test_session: None) -> None:
+    """The never-fail-the-scan contract, this stage's version: a
+    `generate_report` exception must be caught, logged, and rolled back —
+    the scan still reaches COMPLETED with error_message still None,
+    mirroring the equivalent Phase 3/4/6/7 tests. Exercised against a real
+    monkeypatched-to-raise `generate_report`, not just asserted.
+
+    Note: `generate_report` itself already never raises (its own internal
+    try/except swallows everything) -- this test's `side_effect` bypasses
+    that by replacing the function entirely, proving `tasks.py`'s own
+    try/except around the call site is a genuine, independent safety net,
+    not dead code relying solely on the callee's own discipline.
+    """
+    scan = _make_scan(db, value="127.0.0.1")
+    fake_results = [PortScanResult(port=80, protocol="tcp", state="open")]
+
+    with (
+        patch.object(NativePortScanner, "scan", return_value=fake_results),
+        patch.object(
+            tasks_module, "generate_report", side_effect=RuntimeError("report generation boom")
+        ) as mock_generate_report,
+    ):
+        tasks_module.run_scan_task(str(scan.id))
+
+    mock_generate_report.assert_called_once()
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.COMPLETED
+    assert scan.completed_at is not None
+    assert scan.error_message is None
+    # generate_report never ran for real -- no Report row was created.
+    assert db.execute(select(Report).where(Report.scan_id == scan.id)).first() is None
+
+
+def test_generate_report_called_with_single_asset_list(db: Session, use_test_session: None) -> None:
+    """`generate_report` must be invoked with `(db, scan, [asset])` -- the
+    single Asset ORM object already built earlier in the task, passed as
+    a one-element list (same call-site shape as `score_assets` one stage
+    earlier).
+    """
+    scan = _make_scan(db, value="127.0.0.1")
+    fake_results = [PortScanResult(port=80, protocol="tcp", state="open")]
+
+    with (
+        patch.object(NativePortScanner, "scan", return_value=fake_results),
+        patch.object(tasks_module, "generate_report") as mock_generate_report,
+    ):
+        tasks_module.run_scan_task(str(scan.id))
+
+    mock_generate_report.assert_called_once()
+    call_args = mock_generate_report.call_args.args
+    passed_scan, passed_assets = call_args[1], call_args[2]
+    assert passed_scan.id == scan.id
+    assert len(passed_assets) == 1
+    asset = db.execute(select(Asset).where(Asset.scan_id == scan.id)).scalar_one()
+    assert passed_assets[0].id == asset.id
+
+
+def test_full_run_persists_exactly_one_report_row(db: Session, use_test_session: None) -> None:
+    """End-to-end (real `generate_report`, same spirit as the Phase 7
+    `test_full_run_populates_risk_score_and_tier_on_scan_and_asset` test
+    above): a full `run_scan_task` run reaches COMPLETED with exactly one
+    `Report` row persisted for that scan.
+    """
+    scan = _make_scan(db, value="127.0.0.1")
+    fake_results = [PortScanResult(port=22, protocol="tcp", state="open")]
+
+    with patch.object(NativePortScanner, "scan", return_value=fake_results):
+        tasks_module.run_scan_task(str(scan.id))
+
+    db.refresh(scan)
+    assert scan.status == ScanStatus.COMPLETED
+    assert scan.error_message is None
+
+    reports = db.execute(select(Report).where(Report.scan_id == scan.id)).scalars().all()
+    assert len(reports) == 1
+    assert reports[0].summary["target"]["value"] == "127.0.0.1"
