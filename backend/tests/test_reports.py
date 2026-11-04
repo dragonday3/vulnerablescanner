@@ -46,6 +46,7 @@ def test_get_scan_report_returns_404_for_nonexistent_scan(client: TestClient) ->
     resp = client.get(f"/api/v1/scans/{uuid.uuid4()}/report")
 
     assert resp.status_code == 404
+    assert "scan" in resp.json()["detail"].lower()
 
 
 def test_get_scan_report_returns_404_before_report_generation(client: TestClient) -> None:
@@ -60,6 +61,7 @@ def test_get_scan_report_returns_404_before_report_generation(client: TestClient
     resp = client.get(f"/api/v1/scans/{scan['id']}/report")
 
     assert resp.status_code == 404
+    assert "report" in resp.json()["detail"].lower()
 
 
 def test_get_scan_report_returns_200_with_expected_summary_shape(

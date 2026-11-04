@@ -212,9 +212,9 @@ export default async function ScanReportPage({
                               <span className="text-xs text-zinc-400">None</span>
                             ) : (
                               <div className="flex flex-col gap-1">
-                                {service.findings.map((finding) => (
+                                {service.findings.map((finding, index) => (
                                   <div
-                                    key={finding.cve_id}
+                                    key={`${finding.cve_id}-${index}`}
                                     className={`flex flex-wrap items-center gap-1.5 ${
                                       finding.validation_state === "false_positive"
                                         ? "opacity-50"
