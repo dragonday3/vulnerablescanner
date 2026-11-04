@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, Text, func
+from sqlalchemy import DateTime, Enum, Float, ForeignKey, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -56,6 +56,17 @@ class Scan(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     celery_task_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # --- Phase 7 additions ---
+    # NULL means "not yet risk-scored" (pre-Phase-7 row, or this scan
+    # hasn't reached RISK_ANALYSIS yet) -- a real, distinct state from a
+    # computed score of 0.0/tier "NONE" ("scored, nothing found"). See
+    # PLAN_7.md's architecture-decision #3 for why this is nullable where
+    # Finding.confidence_score is not.
+    risk_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # CRITICAL/HIGH/MEDIUM/LOW/NONE -- same vocabulary and same
+    # plain-string-not-enum convention as Finding.severity/
+    # Misconfiguration.severity.
+    risk_tier: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     project: Mapped["Project"] = relationship(back_populates="scans")
     target: Mapped["Target"] = relationship()

@@ -117,6 +117,14 @@ export default async function ScanResultsPage({
             ) : (
               <span className="text-sm text-zinc-400">Unknown target</span>
             )}
+            {scan.risk_tier != null && (
+              <span className="flex items-center gap-1.5">
+                <SeverityBadge severity={scan.risk_tier} />
+                <span className="text-xs text-zinc-500">
+                  Risk: {scan.risk_score?.toFixed(1)}
+                </span>
+              </span>
+            )}
           </div>
 
           <dl className="grid grid-cols-2 gap-x-6 gap-y-1 text-sm sm:grid-cols-3">
@@ -160,8 +168,16 @@ export default async function ScanResultsPage({
                 key={asset.id}
                 className="overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-sm"
               >
-                <div className="border-b border-zinc-100 px-4 py-3">
+                <div className="flex flex-wrap items-center gap-1.5 border-b border-zinc-100 px-4 py-3">
                   <span className="font-mono text-xs text-zinc-600">{asset.host}</span>
+                  {asset.risk_tier != null && (
+                    <>
+                      <SeverityBadge severity={asset.risk_tier} />
+                      <span className="text-xs text-zinc-500">
+                        Risk: {asset.risk_score?.toFixed(1)}
+                      </span>
+                    </>
+                  )}
                 </div>
                 <table className="w-full text-left text-sm">
                   <thead className="bg-zinc-50 text-xs uppercase tracking-wide text-zinc-500">

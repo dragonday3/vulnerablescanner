@@ -258,6 +258,51 @@ def test_get_scan_error_message_is_null_when_not_failed(client: TestClient) -> N
     assert status_resp.json()["error_message"] is None
 
 
+def test_get_scan_risk_score_and_tier_are_null_for_freshly_created_scan(
+    client: TestClient,
+) -> None:
+    """Phase 7: a scan that hasn't reached RISK_ANALYSIS yet must expose
+    `risk_score`/`risk_tier` as `null`, never an omitted key - distinguishing
+    "never scored" from a genuinely clean "scored, nothing found" result
+    (which lands on 0.0/"NONE", not null - see risk_scorer.py's contract).
+    """
+    ctx = _create_authorized_target(client)
+    scan = _create_scan(client, ctx)
+
+    resp = client.get(f"/api/v1/scans/{scan['id']}")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "risk_score" in body
+    assert body["risk_score"] is None
+    assert "risk_tier" in body
+    assert body["risk_tier"] is None
+
+
+def test_get_scan_exposes_risk_score_and_tier_once_populated(
+    client: TestClient, db: Session
+) -> None:
+    """Once `risk_scorer.py` has run, `GET /scans/{id}` must surface the
+    real, non-null `risk_score`/`risk_tier` values it persisted onto
+    `Scan` - same DB-bypass pattern already used above for `error_message`.
+    """
+    ctx = _create_authorized_target(client)
+    scan = _create_scan(client, ctx)
+
+    scan_row = db.get(Scan, uuid.UUID(scan["id"]))
+    assert scan_row is not None
+    scan_row.risk_score = 62.5
+    scan_row.risk_tier = "HIGH"
+    db.commit()
+
+    resp = client.get(f"/api/v1/scans/{scan['id']}")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["risk_score"] == 62.5
+    assert body["risk_tier"] == "HIGH"
+
+
 def test_cancel_still_succeeds_when_revoke_raises(
     client: TestClient, mock_celery_control_revoke: MagicMock
 ) -> None:
@@ -330,6 +375,13 @@ def test_get_scan_assets_returns_nested_assets_and_services_with_fingerprint_fie
     assert asset_body["scan_id"] == scan["id"]
     assert asset_body["host"] == "10.0.0.10"
     assert len(asset_body["services"]) == 2
+    # Phase 7: this asset hasn't been risk-scored yet, so both fields must be
+    # present and null - not an omitted key - distinguishing "never scored"
+    # from a genuinely clean "scored, nothing found" result (0.0/"NONE").
+    assert "risk_score" in asset_body
+    assert asset_body["risk_score"] is None
+    assert "risk_tier" in asset_body
+    assert asset_body["risk_tier"] is None
 
     services_by_port = {s["port"]: s for s in asset_body["services"]}
     fingerprinted = services_by_port[443]
@@ -529,6 +581,39 @@ def test_get_scan_assets_returns_nested_misconfigurations_for_flagged_service(
 
     clean = services_by_port[22]
     assert clean["misconfigurations"] == []
+
+
+def test_get_scan_assets_exposes_risk_score_and_tier_once_populated(
+    client: TestClient, db: Session
+) -> None:
+    """Once `risk_scorer.py` has run, `GET /scans/{id}/assets` must surface
+    the real, non-null `risk_score`/`risk_tier` values it persisted onto
+    `Asset` - same DB-bypass pattern used for the scan-level equivalent
+    above.
+    """
+    ctx = _create_authorized_target(client)
+    scan = _create_scan(client, ctx)
+
+    asset = Asset(
+        project_id=uuid.UUID(ctx["project"]["id"]),
+        target_id=uuid.UUID(ctx["target"]["id"]),
+        scan_id=uuid.UUID(scan["id"]),
+        host="10.0.0.10",
+        risk_score=0.0,
+        risk_tier="NONE",
+    )
+    db.add(asset)
+    db.commit()
+
+    resp = client.get(f"/api/v1/scans/{scan['id']}/assets")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    # 0.0/"NONE" is the genuinely-scored-clean value, not null - must
+    # round-trip as such, not be coerced to/confused with "never scored".
+    assert body[0]["risk_score"] == 0.0
+    assert body[0]["risk_tier"] == "NONE"
 
 
 def test_get_scan_assets_returns_404_for_nonexistent_scan(client: TestClient) -> None:

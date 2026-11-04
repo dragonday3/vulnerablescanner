@@ -25,6 +25,10 @@ class ScanRead(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     error_message: str | None
+    # Phase 7: null until the scan reaches RISK_ANALYSIS; a scored scan with
+    # zero findings/misconfigs lands on 0.0/"NONE", never null again.
+    risk_score: float | None
+    risk_tier: str | None
 
 
 class ScanStatusRead(BaseModel):

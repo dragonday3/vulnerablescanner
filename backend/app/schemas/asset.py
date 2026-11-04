@@ -16,3 +16,7 @@ class AssetRead(BaseModel):
     host: str
     created_at: datetime
     services: list[ServiceRead] = []
+    # Phase 7: null until this asset's own risk scoring has run; a scored
+    # asset with zero findings/misconfigs lands on 0.0/"NONE", never null.
+    risk_score: float | None
+    risk_tier: str | None
