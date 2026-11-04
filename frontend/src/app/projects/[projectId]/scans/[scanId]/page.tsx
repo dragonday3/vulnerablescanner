@@ -93,12 +93,22 @@ export default async function ScanResultsPage({
     <div className="min-h-screen bg-zinc-50">
       <div className="mx-auto flex w-full max-w-3xl flex-col gap-8 px-6 py-12">
         <header className="flex flex-col gap-1">
-          <Link
-            href={`/projects/${projectId}`}
-            className="text-sm text-zinc-500 hover:underline"
-          >
-            &larr; Back to project
-          </Link>
+          <div className="flex items-center justify-between">
+            <Link
+              href={`/projects/${projectId}`}
+              className="text-sm text-zinc-500 hover:underline"
+            >
+              &larr; Back to project
+            </Link>
+            {scan.status === "completed" && (
+              <Link
+                href={`/projects/${projectId}/scans/${scanId}/report`}
+                className="text-sm text-blue-600 hover:underline"
+              >
+                View report &rarr;
+              </Link>
+            )}
+          </div>
           <h1 className="text-2xl font-semibold text-zinc-900">
             Scan {shortId(scan.id)}
           </h1>

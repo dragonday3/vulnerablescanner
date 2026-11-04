@@ -1,6 +1,7 @@
 import { request } from "./client";
 import type { ScanCreate, ScanRead } from "@/lib/types/scan";
 import type { AssetRead } from "@/lib/types/asset";
+import type { ReportRead } from "@/lib/types/report";
 
 /**
  * GET /scans (optionally filtered by project_id) — used by the
@@ -27,4 +28,9 @@ export function getScan(scanId: string): Promise<ScanRead> {
 /** GET /scans/{id}/assets — used by the /projects/[projectId]/scans/[scanId] page (Phase 3 Task 6). */
 export function getScanAssets(scanId: string): Promise<AssetRead[]> {
   return request<AssetRead[]>(`/scans/${scanId}/assets`);
+}
+
+/** GET /scans/{id}/report — 404 until the scan reaches REPORT_GENERATION. */
+export function getScanReport(scanId: string): Promise<ReportRead> {
+  return request<ReportRead>(`/scans/${scanId}/report`);
 }

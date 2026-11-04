@@ -5,10 +5,12 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.models.asset import Asset
+from app.models.report import Report
 from app.models.scan import Scan
 from app.schemas.asset import AssetRead
+from app.schemas.report import ReportRead
 from app.schemas.scan import ScanCreate, ScanRead, ScanStatusRead
-from app.services import scan_service
+from app.services import report_service, scan_service
 
 router = APIRouter(prefix="/scans", tags=["scans"])
 
@@ -41,3 +43,8 @@ def cancel_scan(scan_id: uuid.UUID, db: Session = Depends(get_db)) -> Scan:
 @router.get("/{scan_id}/assets", response_model=list[AssetRead])
 def get_scan_assets(scan_id: uuid.UUID, db: Session = Depends(get_db)) -> list[Asset]:
     return scan_service.get_scan_assets(db, scan_id)
+
+
+@router.get("/{scan_id}/report", response_model=ReportRead)
+def get_scan_report(scan_id: uuid.UUID, db: Session = Depends(get_db)) -> Report:
+    return report_service.get_report(db, scan_id)
