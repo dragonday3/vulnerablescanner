@@ -82,6 +82,14 @@ def _cve_entry(
     }
 
 
+# Real NVD shape for V4.0 metrics (confirmed live against the actual NVD
+# API, CVE-2025-0168): `baseSeverity` lives INSIDE `cvssData`, same as
+# V31/V30 -- unlike V2, which puts it as a sibling (see _V2_METRICS below).
+_V40_METRICS = {
+    "cvssMetricV40": [
+        {"cvssData": {"baseScore": 5.3, "baseSeverity": "MEDIUM", "vectorString": "CVSS:4.0/X"}}
+    ]
+}
 _V31_METRICS = {
     "cvssMetricV31": [
         {"cvssData": {"baseScore": 9.8, "baseSeverity": "CRITICAL", "vectorString": "CVSS:3.1/X"}}
@@ -111,8 +119,8 @@ _V2_METRICS = {
 
 
 def test_fetch_cves_normal_response_parses_with_cvss_fallback_priority(monkeypatch) -> None:
-    """One CVE per metric tier, plus one CVE that has ALL THREE tiers
-    present at once -- proving V31 is preferred over V30/V2 when more
+    """One CVE per metric tier, plus one CVE that has ALL FOUR tiers
+    present at once -- proving V40 is preferred over V31/V30/V2 when more
     than one is available, not just "used when it's the only one".
     """
     body = {
@@ -136,8 +144,8 @@ def test_fetch_cves_normal_response_parses_with_cvss_fallback_priority(monkeypat
             _cve_entry("CVE-2024-0004", metrics={}),  # no metrics at all
             _cve_entry(
                 "CVE-2024-0005",
-                # All three present: V31 must win.
-                metrics={**_V31_METRICS, **_V30_METRICS, **_V2_METRICS},
+                # All four present: V40 must win.
+                metrics={**_V40_METRICS, **_V31_METRICS, **_V30_METRICS, **_V2_METRICS},
             ),
         ]
     }
@@ -187,13 +195,40 @@ def test_fetch_cves_normal_response_parses_with_cvss_fallback_priority(monkeypat
         NormalizedCve(
             cve_id="CVE-2024-0005",
             description=None,
-            severity="CRITICAL",  # V31 wins even though V30/V2 are also present
-            cvss_score=9.8,
-            cvss_vector="CVSS:3.1/X",
+            severity="MEDIUM",  # V40 wins even though V31/V30/V2 are also present
+            cvss_score=5.3,
+            cvss_vector="CVSS:4.0/X",
             references=[],
             raw=body["vulnerabilities"][4]["cve"],
         ),
     ]
+
+
+def test_fetch_cves_v40_only_cve_parses_correct_severity(monkeypatch) -> None:
+    """A CPE whose ONLY metrics are V4.0 (the newest scheme, increasingly
+    common on 2024+ CVEs) must parse successfully -- `baseSeverity` lives
+    inside `cvssData` here, same as V31/V30, so no V2-style special case
+    is needed, but V40 must actually be tried before falling through to
+    "NONE".
+    """
+    body = {
+        "vulnerabilities": [
+            _cve_entry(
+                "CVE-2025-0168",
+                descriptions=[{"lang": "en", "value": "a v4.0-only CVE"}],
+                metrics=_V40_METRICS,
+            )
+        ]
+    }
+    monkeypatch.setattr(httpx, "get", lambda *a, **kw: httpx.Response(200, json=body))
+
+    result = fetch_cves_for_cpe(CPE23, _FAKE_REDIS, rate_limiter=_NoopRateLimiter())
+
+    assert result is not None
+    (cve,) = result.cves
+    assert cve.severity == "MEDIUM"
+    assert cve.cvss_score == 5.3
+    assert cve.cvss_vector == "CVSS:4.0/X"
 
 
 def test_fetch_cves_v2_only_cve_parses_correct_severity(monkeypatch) -> None:

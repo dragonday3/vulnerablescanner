@@ -201,8 +201,7 @@ conventions below should track reality, not the plan that predates it.
   `${cve_id}-${index}` instead. See `PLAN_8.md` / `PLAN_8_TASKS.md`.
 - **Known, deliberately deferred gaps**, for whichever future work
   picks them up (no further phase is currently planned — Phase 8 was
-  the last item on the original roadmap): CVSS v4 (`cvssMetricV40`)
-  isn't read, so a V4-only-scored CVE shows severity `NONE`; a scan
+  the last item on the original roadmap): a scan
   with zero findings looks identical whether that's a genuinely clean
   result or a correlation failure (NVD outage, rate-limit timeout) — no
   per-scan outcome tracking yet; `confidence_score`'s band constants
@@ -279,6 +278,17 @@ conventions below should track reality, not the plan that predates it.
   higher `confidence_score`. The frontend's `${cve_id}-${index}` key
   stays in place as defense in depth even though this fix removes the
   duplicate `cve_id` entries it was originally guarding against.
+- **CVSS v4 support** (post-roadmap, no PLAN_N): `nvd_client.py`'s
+  `_extract_cvss_metrics` now also tries `cvssMetricV40`, ahead of
+  V31/V30/V2 — previously a V4-only-scored CVE (increasingly common on
+  2024+ CVEs) fell through every tier and showed severity `NONE`/no
+  score, which was silently wrong (not "no data", but "data this client
+  didn't know how to read"). Confirmed the real NVD response shape for
+  V40 live before writing the fix (CVE-2025-0168): `baseSeverity` lives
+  inside `cvssData`, same as V31/V30, not a sibling like V2 — no new
+  special case needed beyond adding the key to the existing priority
+  tuple. See Conventions below for the vulnerability-correlation
+  paragraph's fuller note.
 
 ## Stack & architecture
 
@@ -359,9 +369,15 @@ conventions below should track reality, not the plan that predates it.
   NVD rejecting `isVulnerable=true` (needs `isVulnerable=""`), and CVSS
   v2's `baseSeverity` living beside `cvssData` on the metric object, not
   nested inside it (unlike v3) — both were invisible to every mocked unit
-  test and only surfaced via a real live NVD call. Backend tests need a
-  reachable Redis (`TEST_REDIS_URL`, defaults to `REDIS_URL` on DB index
-  15) in addition to the Postgres test database.
+  test and only surfaced via a real live NVD call. `_extract_cvss_metrics`
+  tries `cvssMetricV40` > `V31` > `V30` > `V2` in that priority order
+  (newest first, per NVD's own convention when a CVE carries more than
+  one) — V40's `baseSeverity` lives inside `cvssData`, same shape as
+  V31/V30, confirmed live against a real CVE before this was added (post-
+  roadmap fix, no PLAN_N; was previously a known gap: a V4-only-scored CVE
+  showed severity `NONE`). Backend tests need a reachable Redis
+  (`TEST_REDIS_URL`, defaults to `REDIS_URL` on DB index 15) in addition
+  to the Postgres test database.
 - **Confidence & validation** (Phase 5): `confidence.py`'s
   `compute_confidence` is a pure function — no DB/Redis/network, every
   branch (missing `method`, missing/malformed/out-of-range `conf`)
