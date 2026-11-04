@@ -4,6 +4,7 @@ from app.models.cve_cache import CveCache  # noqa: F401,E402
 from app.models.finding import Finding  # noqa: F401,E402
 from app.models.misconfiguration import Misconfiguration  # noqa: F401,E402
 from app.models.project import Project  # noqa: F401,E402
+from app.models.report import Report  # noqa: F401,E402
 from app.models.scan import Scan  # noqa: F401,E402
 from app.models.service import Service  # noqa: F401,E402
 from app.models.target import Target  # noqa: F401,E402
