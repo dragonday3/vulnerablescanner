@@ -71,11 +71,12 @@ def _add_finding(
     confidence_score: float = 100.0,
     validation_state: FindingValidationState = FindingValidationState.UNVALIDATED,
     cve_id: str = "CVE-2021-41773",
+    matched_cpe: str = "cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*",
 ) -> Finding:
     finding = Finding(
         service_id=service.id,
         cve_id=cve_id,
-        matched_cpe="cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*",
+        matched_cpe=matched_cpe,
         severity=severity,
         cvss_score=cvss_score,
         evidence={},
@@ -344,6 +345,96 @@ def test_false_positive_finding_contributes_nothing_to_asset_score(db: Session) 
     db.refresh(asset)
     assert asset.risk_score == 0.0
     assert asset.risk_tier == "NONE"
+
+
+# ---------------------------------------------------------------------------
+# CVE double-counting: the same CVE matched via two different CPEs on the
+# SAME service is a correlation artifact and must contribute exactly one
+# noisy-OR term, not two (finding_dedup.py). The same CVE on two different
+# services is a real, separate vulnerable surface and must still contribute
+# twice -- dedup is scoped per-service, not per-asset.
+# ---------------------------------------------------------------------------
+
+
+def test_same_cve_two_cpes_one_service_contributes_once(db: Session) -> None:
+    scan = _make_scan(db)
+    asset = _make_asset(db, scan)
+    service = _add_service(db, asset, port=443)
+    _add_finding(
+        db,
+        service,
+        cve_id="CVE-2021-41773",
+        matched_cpe="cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*",
+        cvss_score=9.0,
+        confidence_score=100.0,
+    )
+    _add_finding(
+        db,
+        service,
+        cve_id="CVE-2021-41773",
+        matched_cpe="cpe:2.3:a:apache:http_server:2.4.50:*:*:*:*:*:*:*",
+        cvss_score=9.0,
+        confidence_score=100.0,
+    )
+
+    score_assets(db, scan, [asset])
+
+    db.refresh(asset)
+    # If this double-counted, noisy-OR over [90.0, 90.0] would be
+    # 1 - (1-0.9)(1-0.9) = 99.0, not 90.0.
+    assert asset.risk_score == 90.0
+    assert asset.risk_tier == "CRITICAL"
+
+
+def test_same_cve_two_different_services_still_contributes_twice(db: Session) -> None:
+    scan = _make_scan(db)
+    asset = _make_asset(db, scan)
+    service_a = _add_service(db, asset, port=443)
+    service_b = _add_service(db, asset, port=8443)
+    _add_finding(db, service_a, cve_id="CVE-2021-41773", cvss_score=9.0, confidence_score=100.0)
+    _add_finding(db, service_b, cve_id="CVE-2021-41773", cvss_score=9.0, confidence_score=100.0)
+
+    score_assets(db, scan, [asset])
+
+    db.refresh(asset)
+    # Two distinct services genuinely both vulnerable -> noisy-OR over
+    # [90.0, 90.0] = 99.0, deliberately NOT deduped across services.
+    assert asset.risk_score == 99.0
+    assert asset.risk_tier == "CRITICAL"
+
+
+def test_dedup_prefers_non_false_positive_over_false_positive(db: Session) -> None:
+    """One CPE's match was reviewed and dismissed; the other CPE's match
+    on the exact same CVE/service was not. The real (non-FP) match must
+    still contribute -- reviewing out one CPE's evidence is not evidence
+    the CVE is absent via the other CPE too.
+    """
+    scan = _make_scan(db)
+    asset = _make_asset(db, scan)
+    service = _add_service(db, asset, port=443)
+    _add_finding(
+        db,
+        service,
+        cve_id="CVE-2021-41773",
+        matched_cpe="cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*",
+        cvss_score=9.0,
+        confidence_score=100.0,
+        validation_state=FindingValidationState.FALSE_POSITIVE,
+    )
+    _add_finding(
+        db,
+        service,
+        cve_id="CVE-2021-41773",
+        matched_cpe="cpe:2.3:a:apache:http_server:2.4.50:*:*:*:*:*:*:*",
+        cvss_score=9.0,
+        confidence_score=100.0,
+        validation_state=FindingValidationState.UNVALIDATED,
+    )
+
+    score_assets(db, scan, [asset])
+
+    db.refresh(asset)
+    assert asset.risk_score == 90.0
 
 
 def test_asset_score_combines_findings_and_misconfigs_across_services(db: Session) -> None:

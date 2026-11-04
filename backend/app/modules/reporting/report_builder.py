@@ -9,6 +9,7 @@ nothing here raises on a well-typed input.
 from app.models.asset import Asset
 from app.models.finding import FindingValidationState
 from app.models.scan import Scan
+from app.modules.vulnerability.finding_dedup import dedupe_findings_by_cve
 
 _SEVERITY_KEYS = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "NONE")
 
@@ -42,7 +43,13 @@ def build_report_summary(scan: Scan, assets: list[Asset]) -> dict:
         service_entries: list[dict] = []
         for service in asset.services:
             finding_entries: list[dict] = []
-            for finding in service.findings:
+            # Same artifact as risk_scorer.py's: the same CVE matched twice
+            # via two CPEs on this one service is one vulnerability, not
+            # two -- dedup before counting/listing (never across services,
+            # see finding_dedup.py's docstring). This is also what fixed
+            # the duplicate-cve_id React-key collision at its root; the
+            # frontend's `${cve_id}-${index}` key stays as defense in depth.
+            for finding in dedupe_findings_by_cve(service.findings):
                 findings_total += 1
                 findings_by_severity[finding.severity] = (
                     findings_by_severity.get(finding.severity, 0) + 1

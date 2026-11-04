@@ -35,6 +35,7 @@ from app.modules.risk.scoring import (
     score_misconfiguration_contribution,
     tier_for_score,
 )
+from app.modules.vulnerability.finding_dedup import dedupe_findings_by_cve
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,13 @@ def score_assets(db: Session, scan: Scan, assets: list[Asset]) -> None:
         try:
             contributions: list[float] = []
             for service in asset.services:
-                for finding in service.findings:
+                # Dedup is scoped to this one service's own findings -- the
+                # same CVE matched twice here via two CPEs is a correlation
+                # artifact (one vulnerability, double-counted); the same CVE
+                # on a different service is a second, real vulnerable
+                # surface and must still contribute its own term. See
+                # finding_dedup.py's docstring.
+                for finding in dedupe_findings_by_cve(service.findings):
                     contributions.append(score_finding_contribution(finding))
                 for misconfig in service.misconfigurations:
                     contributions.append(score_misconfiguration_contribution(misconfig))

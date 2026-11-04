@@ -24,10 +24,11 @@ def _finding(
     cvss_score: float | None = 7.5,
     confidence_score: float = 100.0,
     validation_state: FindingValidationState = FindingValidationState.UNVALIDATED,
+    matched_cpe: str = "cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*",
 ) -> Finding:
     return Finding(
         cve_id=cve_id,
-        matched_cpe="cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*",
+        matched_cpe=matched_cpe,
         severity=severity,
         cvss_score=cvss_score,
         evidence={"raw": "must-not-appear-in-report"},
@@ -260,6 +261,72 @@ def test_in_memory_finding_with_unset_validation_state_counts_as_unvalidated() -
 
     assert report["findings_summary"]["by_validation_state"]["unvalidated"] == 1
     assert report["assets"][0]["services"][0]["findings"][0]["validation_state"] == "unvalidated"
+
+
+# --- CVE double-counting (finding_dedup.py) --------------------------------
+
+
+def test_same_cve_two_cpes_one_service_counted_and_listed_once() -> None:
+    """The same CVE matched via two different CPEs on one Service is a
+    correlation artifact, not two vulnerabilities -- must appear exactly
+    once in both the counts and the per-service findings list.
+    """
+    service = _service(
+        443,
+        findings=[
+            _finding(
+                cve_id="CVE-2021-41773",
+                matched_cpe="cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*",
+            ),
+            _finding(
+                cve_id="CVE-2021-41773",
+                matched_cpe="cpe:2.3:a:apache:http_server:2.4.50:*:*:*:*:*:*:*",
+            ),
+        ],
+    )
+    report = build_report_summary(_scan(), [_asset("10.0.0.5", [service])])
+
+    assert report["findings_summary"]["total"] == 1
+    assert report["findings_summary"]["by_severity"]["HIGH"] == 1
+    entries = report["assets"][0]["services"][0]["findings"]
+    assert len(entries) == 1
+    assert entries[0]["cve_id"] == "CVE-2021-41773"
+
+
+def test_same_cve_two_different_services_counted_and_listed_twice() -> None:
+    """The same CVE on two different Services is a real, separate
+    vulnerable surface on each -- must NOT be deduped across services.
+    """
+    service_a = _service(443, findings=[_finding(cve_id="CVE-2021-41773")])
+    service_b = _service(8443, findings=[_finding(cve_id="CVE-2021-41773")])
+    report = build_report_summary(_scan(), [_asset("10.0.0.5", [service_a, service_b])])
+
+    assert report["findings_summary"]["total"] == 2
+    assert len(report["assets"][0]["services"][0]["findings"]) == 1
+    assert len(report["assets"][0]["services"][1]["findings"]) == 1
+
+
+def test_dedup_prefers_non_false_positive_entry_in_the_listed_detail() -> None:
+    fp = _finding(
+        cve_id="CVE-2021-41773",
+        matched_cpe="cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*",
+        validation_state=FindingValidationState.FALSE_POSITIVE,
+    )
+    real = _finding(
+        cve_id="CVE-2021-41773",
+        matched_cpe="cpe:2.3:a:apache:http_server:2.4.50:*:*:*:*:*:*:*",
+        validation_state=FindingValidationState.UNVALIDATED,
+    )
+    service = _service(443, findings=[fp, real])
+    report = build_report_summary(_scan(), [_asset("10.0.0.5", [service])])
+
+    (entry,) = report["assets"][0]["services"][0]["findings"]
+    assert entry["validation_state"] == "unvalidated"
+    assert report["findings_summary"]["by_validation_state"] == {
+        "unvalidated": 1,
+        "confirmed": 0,
+        "false_positive": 0,
+    }
 
 
 # --- misconfiguration counts -----------------------------------------------

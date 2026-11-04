@@ -224,13 +224,14 @@ conventions below should track reality, not the plan that predates it.
   positive, concretely confirming the same "clustered near the
   ceiling" pattern `confidence_score` already shows, before leaning on
   this score for cross-scan/multi-asset prioritization (candidate
-  remedies: a per-asset top-N or max-plus-diminishing-tail aggregation
-  instead of plain noisy-OR, or de-duplicating by CVE before scoring —
-  today the same CVE can contribute two independent noisy-OR terms to
-  one asset via two CPEs on one service, or the same CVE on two
-  services, which pushes saturation further **and, as of Phase 8, also
-  double-counts in the report's findings-by-severity/by-validation-state
-  totals the same way**); `risk_score`/`risk_tier` and, as of Phase 8,
+  remedy still open: a per-asset top-N or max-plus-diminishing-tail
+  aggregation instead of plain noisy-OR — the same-CVE-via-two-CPEs
+  half of this saturation problem is now fixed, see the CVE dedup
+  bullet below; the same CVE legitimately appearing on two different
+  *services* is NOT deduped, by design, and still saturates both the
+  risk score and the report the same way, since that's two real
+  vulnerable surfaces, not an artifact); `risk_score`/`risk_tier` and,
+  as of Phase 8,
   the generated `Report` itself are both snapshots taken once during
   their respective pipeline stages — confirming or invalidating a
   `Finding` via `PATCH /findings/{id}` after a scan completes does
@@ -260,6 +261,24 @@ conventions below should track reality, not the plan that predates it.
   manually; CI itself didn't exist until after Phase 8 — verify
   `git remote -v` / `.github/` before assuming either predates what you're
   reading here.
+- **CVE dedup fix** (post-roadmap, no PLAN_N — a scoped bug fix, not a
+  phase): the same CVE matched via two different CPEs on one `Service`
+  was double-counting — once in Phase 7's risk-score aggregation, once
+  in Phase 8's report totals and per-service findings list (the gap both
+  phases' own docs flagged, and the root cause of the duplicate-React-key
+  bug Phase 8's final review fixed with `${cve_id}-${index}`). Fixed with
+  one new pure helper, `backend/app/modules/vulnerability/
+  finding_dedup.py`'s `dedupe_findings_by_cve`, called from both
+  `risk_scorer.py`'s and `report_builder.py`'s per-service loops —
+  deliberately scoped to within one `Service`'s own `findings` only: the
+  same CVE on a *different* Service of the same Asset is a real, separate
+  vulnerable surface and still contributes/counts twice, by design (see
+  the deferred-gaps bullet above). Tie-break when collapsing duplicates:
+  prefer whichever row is NOT `FALSE_POSITIVE` (one CPE's match being
+  reviewed out isn't evidence against the other CPE's match), then the
+  higher `confidence_score`. The frontend's `${cve_id}-${index}` key
+  stays in place as defense in depth even though this fix removes the
+  duplicate `cve_id` entries it was originally guarding against.
 
 ## Stack & architecture
 
@@ -410,7 +429,12 @@ conventions below should track reality, not the plan that predates it.
   else — no magic numbers inline in `scoring.py`/`risk_scorer.py`. No
   config table/override API this phase — same "hardcoded-but-named,
   flagged here as first-pass" precedent as `confidence_score`'s bands
-  and Phase 6's `SENSITIVE_PORTS`.
+  and Phase 6's `SENSITIVE_PORTS`. `risk_scorer.py` calls
+  `finding_dedup.dedupe_findings_by_cve` on each `service.findings`
+  before building that service's contributions — never on a
+  flattened/cross-service list (see the CVE dedup fix in Status above).
+  `scoring.py` itself stays dedup-unaware; it only ever sees whatever
+  finding list its caller already deduped.
 - **Reporting** (Phase 8): `report_builder.py`'s `build_report_summary`
   is a pure function — no DB/Redis/network, every branch produces a
   concrete value, never raises on well-formed input. It never copies a
@@ -433,14 +457,19 @@ conventions below should track reality, not the plan that predates it.
   just an application-level convention; don't rely on call-site
   discipline alone. No report regeneration/versioning, no PATCH/POST
   route for reports — a generated report is a fixed, one-time snapshot,
-  same precedent as `risk_score`'s own staleness contract. When
-  rendering a findings list anywhere derived from a `Report.summary`
-  (as opposed to a live `FindingRead` with a real `id`), never key a
-  list render on `cve_id` alone — the same CVE can legitimately appear
-  twice for one service via two different CPEs; key on `cve_id` plus
-  the array index (or carry a real discriminator into the summary
-  shape) instead. This was a real bug the final review caught, not a
-  hypothetical.
+  same precedent as `risk_score`'s own staleness contract.
+  `build_report_summary` calls the same `finding_dedup.
+  dedupe_findings_by_cve` as `risk_scorer.py`, per service, before
+  counting/listing — a service's `findings` list in `Report.summary`
+  can no longer contain two entries with the same `cve_id` (see the CVE
+  dedup fix in Status above). When rendering a findings list anywhere
+  derived from a `Report.summary` (as opposed to a live `FindingRead`
+  with a real `id`), still never key a list render on `cve_id` alone —
+  key on `cve_id` plus the array index, or carry a real discriminator
+  into the summary shape. That was a real bug the Phase 8 final review
+  caught, not a hypothetical; the dedup fix above removed its current
+  trigger but the key itself stays as defense in depth, not something
+  safe to revert now.
 
 ## Running it
 
@@ -448,10 +477,12 @@ See `README.md` Quick Start — `docker compose up --build` (5 services:
 postgres, redis, backend, worker, frontend), then `docker compose exec
 backend alembic upgrade head` (migrations are manual, deliberately not
 run on container start). Verification: `pytest -v`, `ruff check .`,
-`black --check .`, `mypy app` from `backend/`; `next lint` from
-`frontend/`. Windows-specific gotchas (bind-mount hot reload, line
-endings, port collisions) are documented in the README, not repeated
-here.
+`black --check .`, `mypy app` from `backend/`; `next lint` then
+`next build --webpack` from `frontend/` (type-checking goes through
+`next build`, not a standalone `tsc` — see the CI Status bullet above
+for why). `.github/workflows/ci.yml` runs all of this on every push/PR.
+Windows-specific gotchas (bind-mount hot reload, line endings, port
+collisions) are documented in the README, not repeated here.
 
 ## Conventions
 
